@@ -16,10 +16,12 @@ type WebsocketConnection struct {
 }
 
 type Session struct {
-	clientIDs      map[int]*net.Conn
-	clientIDsMu    sync.RWMutex
-	lastActiveTime time.Time
-	clientsActive  atomic.Int32
+	clientIDs        map[int]*net.Conn
+	clientIDsMu      sync.RWMutex
+	wssConnections   []*WebsocketConnection
+	wssConnectionsMu sync.RWMutex
+	lastActiveTime   time.Time
+	clientsActive    atomic.Int32
 }
 
 type Server struct {
@@ -30,10 +32,12 @@ type Server struct {
 
 func NewSession() *Session {
 	return &Session{
-		clientIDs:      make(map[int]*net.Conn),
-		clientIDsMu:    sync.RWMutex{},
-		lastActiveTime: time.Now(),
-		clientsActive:  atomic.Int32{},
+		clientIDs:        make(map[int]*net.Conn),
+		clientIDsMu:      sync.RWMutex{},
+		lastActiveTime:   time.Now(),
+		clientsActive:    atomic.Int32{},
+		wssConnections:   make([]*WebsocketConnection, 0),
+		wssConnectionsMu: sync.RWMutex{},
 	}
 }
 

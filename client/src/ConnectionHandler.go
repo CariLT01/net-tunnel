@@ -8,9 +8,11 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/cloudflare/circl/kem/kyber/kyber768"
 	"github.com/gorilla/websocket"
@@ -53,9 +55,21 @@ func (app *ConnectionHandler) onSocketDied(conn *ProxyWebsocketConnection) {
 	}
 }
 
+func (app *ConnectionHandler) DeleteWebsocket(conn *ProxyWebsocketConnection) {
+	app.wssConnectionsMutex.Lock()
+	defer app.wssConnectionsMutex.Unlock()
+	index := slices.Index(app.wssConnections, conn)
+	if index == -1 {
+		log.Print("error: unable to delete: index not found")
+		return
+	}
+	app.wssConnections = slices.Delete(app.wssConnections, index, index+1)
+}
+
 func (app *ConnectionHandler) HandleWebsocketRead(conn *ProxyWebsocketConnection) {
 	defer conn.connection.Close()
 	defer app.onSocketDied(conn)
+	defer app.DeleteWebsocket(conn)
 
 	scheme := kyber768.Scheme()
 
@@ -93,17 +107,30 @@ func (app *ConnectionHandler) HandleWebsocketRead(conn *ProxyWebsocketConnection
 		} else if message[0] == 2 { // server requested disconnect
 			clientId := message[1]
 
-			app.localConnectionsMutex.RLock()
+			app.localConnectionsMutex.Lock()
 			localConnection, exists := app.localConnections[int(clientId)]
-			app.localConnectionsMutex.RUnlock()
 
 			if !exists {
 				log.Print("ignoring disconnect: client ID ", clientId, " not found")
+				app.localConnectionsMutex.Unlock()
 				continue
 			}
 
 			localConnection.localConnection.Close()
 			log.Print("closed connection ", clientId, " as requested by server")
+			delete(app.localConnections, int(clientId))
+			app.localConnectionsMutex.Unlock()
+
+			app.clientConnectionIDsRWMutex.Lock()
+			_, exists = app.clientConnectionIDs[int(clientId)]
+			if !exists {
+				log.Print("does not exist in clientid")
+				app.clientConnectionIDsRWMutex.Unlock()
+				continue
+			}
+			delete(app.clientConnectionIDs, int(clientId))
+			app.clientConnectionIDsRWMutex.Unlock()
+			log.Print("deleted client id entry: ", clientId)
 		} else if message[0] == 3 {
 			log.Print("received handshake")
 			publicKeyBin := message[1:]
@@ -126,6 +153,8 @@ func (app *ConnectionHandler) HandleWebsocketRead(conn *ProxyWebsocketConnection
 			conn.writeMutex.Unlock()
 			log.Print("wrote ciphertext")
 
+		} else {
+			log.Print("error: unrecognized message type: ", message[0])
 		}
 	}
 }
@@ -170,10 +199,13 @@ func (app *ConnectionHandler) Initialize() {
 		app.CreateWebSocket()
 		log.Print("Connection #", i, " created")
 	}
+
+	go app.MultiplexingScalingLoop()
 }
 
 func (app *ConnectionHandler) SocketWriteMessage(socket *ProxyWebsocketConnection, message []byte) error {
 	socket.writeMutex.Lock()
+	// log.Print("forwarding ", len(message), " to websocket")
 	err := socket.connection.WriteMessage(websocket.BinaryMessage, message)
 	socket.writeMutex.Unlock()
 	return err
@@ -228,6 +260,70 @@ func (app *ConnectionHandler) AssignConnectionHandler() int {
 	return leastWebsocketCountIndex
 }
 
+func (app *ConnectionHandler) FindChosenWebsocketVictim() *ProxyWebsocketConnection {
+	app.wssConnectionsMutex.RLock()
+	defer app.wssConnectionsMutex.RUnlock()
+	var leastConnectionsSocket *ProxyWebsocketConnection
+	leastConnectionsCount := 999999
+	for _, wssConnection := range app.wssConnections {
+		if wssConnection.connectedCount.Load() < int64(leastConnectionsCount) {
+			leastConnectionsCount = int(wssConnection.connectedCount.Load())
+			leastConnectionsSocket = wssConnection
+		}
+	}
+	return leastConnectionsSocket
+
+}
+
+func (app *ConnectionHandler) MultiplexingScalingLoop() {
+	ticker := time.NewTicker(time.Second)
+
+	for range ticker.C {
+		// calculate average connections per socket
+		connectionsPerSocketSum := 0
+		app.wssConnectionsMutex.RLock()
+		for _, wssConnection := range app.wssConnections {
+			connectionsPerSocketSum += int(wssConnection.connectedCount.Load())
+		}
+		connectionsPerSocketAvg := float32(connectionsPerSocketSum) / float32(len(app.wssConnections))
+		app.wssConnectionsMutex.RUnlock()
+
+		log.Print("scaling: connections per socket: ", connectionsPerSocketAvg)
+
+		// levels
+		// < 2 --> drop
+		// > 5 --> add
+
+		if connectionsPerSocketAvg < 6 {
+			log.Print("attempting to downscale")
+			// don't downscale to less than 2
+			if len(app.wssConnections) <= 2 {
+				log.Print("not downscaling, reached minimum wss connection count")
+				continue
+			}
+			// drop the least worthy websocket
+			leastWorthySocket := app.FindChosenWebsocketVictim()
+			if leastWorthySocket == nil {
+				log.Print("error: failed to scale down: no socket to drop")
+				continue
+			}
+
+			leastWorthySocket.connection.Close()
+		} else if connectionsPerSocketAvg > 12 {
+			log.Print("attempting to upscale")
+
+			if len(app.wssConnections) >= NUMBER_OF_CONNECTIONS {
+				log.Print("not upscaling, reached maximum wss connection count")
+			}
+
+			log.Print("creating websocket")
+			app.CreateWebSocket()
+		} else {
+			log.Print("scaling ok -- multiplex: ", len(app.wssConnections), " /  connections per socket avg: ", connectionsPerSocketAvg, " / sum: ", connectionsPerSocketSum)
+		}
+	}
+}
+
 func (app *ConnectionHandler) HandleNewConnection(conn net.Conn) {
 
 	log.Print("new tcp connection")
@@ -255,6 +351,10 @@ func (app *ConnectionHandler) HandleNewConnection(conn net.Conn) {
 	}
 
 	wsSocket.connectedCount.Add(1)
+	// make sure to decrement connected count
+	defer func() {
+		wsSocket.connectedCount.Add(-1)
+	}()
 
 	app.localConnectionsMutex.Lock()
 	localConnection := &ProxyLocalConnection{
@@ -285,8 +385,6 @@ func (app *ConnectionHandler) HandleNewConnection(conn net.Conn) {
 				delete(app.clientConnectionIDs, clientId)
 				app.clientConnectionIDsRWMutex.Unlock()
 
-				// make sure to decrement connected count
-				wsSocket.connectedCount.Add(-1)
 			}
 			return
 		}
@@ -307,26 +405,47 @@ func (app *ConnectionHandler) HandleNewConnection(conn net.Conn) {
 		err = app.SocketWriteMessage(wsSocket, forwardData)
 		if err != nil {
 			log.Print("error: unable to write data, reassigning")
+			attempts := 0
+			oldStream := wsSocket
+			for {
+				if attempts >= 256 {
+					log.Print("error: unable to reassign: too many attempts")
+					return
+				}
 
-			leastWebsocketCountIndex = app.AssignConnectionHandler()
-			if leastWebsocketCountIndex == -1 {
-				log.Print("nothing to reassign to, disconnecting")
-				return
+				leastWebsocketCountIndex = app.AssignConnectionHandler()
+				if leastWebsocketCountIndex == -1 {
+					log.Print("error: nothing to reassign to, disconnecting")
+					return
+				}
+
+				app.wssConnectionsMutex.RLock()
+				wsSocket = app.wssConnections[leastWebsocketCountIndex]
+				app.wssConnectionsMutex.RUnlock()
+
+				localConnection.wssConnectionIndex = leastWebsocketCountIndex
+
+				// reencrypt
+				ciphertext, err := Encrypt(wsSocket.sharedSecret, data)
+				if err != nil {
+					log.Print("error: failed to encrypt: ", err)
+					continue
+				}
+				forwardData := append([]byte{0, byte(clientId)}, ciphertext...)
+
+				// resend!
+				err = app.SocketWriteMessage(wsSocket, forwardData)
+				if err != nil {
+					log.Print("error: new reassigned socket still cannot be written to: ", err, " retrying")
+					attempts++
+				} else {
+					log.Print("reassigned to stream ", leastWebsocketCountIndex, " after ", attempts, " attempts")
+					oldStream.connectedCount.Add(-1)
+					wsSocket.connectedCount.Add(1)
+					break
+				}
 			}
 
-			app.wssConnectionsMutex.RLock()
-			wsSocket = app.wssConnections[leastWebsocketCountIndex]
-			app.wssConnectionsMutex.RUnlock()
-
-			localConnection.wssConnectionIndex = leastWebsocketCountIndex
-
-			// resend!
-
-			err := app.SocketWriteMessage(wsSocket, forwardData)
-			if err != nil {
-				log.Print("new reassigned socket still cannot be written to: ", err, " disconnecting socket")
-				return
-			}
 		}
 
 	}

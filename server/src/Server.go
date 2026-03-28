@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,20 +24,21 @@ func (session *Session) WebsocketWriteMessage(conn *WebsocketConnection, message
 	conn.writeMutex.Lock()
 	err := conn.connection.WriteMessage(websocket.BinaryMessage, message)
 	conn.writeMutex.Unlock()
+	session.lastActiveTime = time.Now()
 	return err
 }
 
-func GetDialTarget(msg []byte) (string, error) {
+func GetDialTarget(msg []byte) (string, string, error) {
 	// Split headers from the first line
 	lines := bytes.SplitN(msg, []byte("\r\n"), 2)
 	if len(lines) == 0 {
-		return "", fmt.Errorf("empty message")
+		return "", "", fmt.Errorf("empty message")
 	}
 
 	requestLine := string(lines[0])
 	parts := strings.Fields(requestLine)
 	if len(parts) < 2 {
-		return "", fmt.Errorf("invalid request line")
+		return "", "", fmt.Errorf("invalid request line")
 	}
 
 	method := parts[0]
@@ -52,7 +54,7 @@ func GetDialTarget(msg []byte) (string, error) {
 			target = target + ":443"
 		}
 
-		return target, nil
+		return target, method, nil
 	}
 
 	// -------------------------
@@ -70,7 +72,7 @@ func GetDialTarget(msg []byte) (string, error) {
 			host += ":80"
 		}
 
-		return host, nil
+		return host, method, nil
 	}
 
 	// Fallback: extract Host header
@@ -83,14 +85,89 @@ func GetDialTarget(msg []byte) (string, error) {
 				host += ":80"
 			}
 
-			return host, nil
+			return host, method, nil
 		}
 	}
 
-	return "", fmt.Errorf("could not determine target host")
+	return "", "", fmt.Errorf("could not determine target host")
+}
+
+func (session *Session) SendAndReassign(wsConn *WebsocketConnection, clientId int, message []byte) *WebsocketConnection {
+
+	ct, err := Encrypt(wsConn.sharedSecret, message)
+	if err != nil {
+		log.Print("failed to encrypt: ", err)
+		return wsConn
+	}
+
+	// log.Print("forwarding ", len(ct), " bytes to wsConn")
+	err = session.WebsocketWriteMessage(wsConn, append([]byte{0, byte(clientId)}, ct...))
+	if err == nil {
+		return wsConn
+	} else {
+		log.Print("need to reassign, first write failed")
+	}
+
+	attempts := 0
+	for {
+
+		if attempts > 256 {
+			log.Print("error: failed to reassign: too many attempts")
+			return nil
+		}
+
+		session.wssConnectionsMu.RLock()
+		if len(session.wssConnections) == 0 {
+			log.Print("error: nothing to reassign to, disconnecting")
+			session.wssConnectionsMu.RUnlock()
+			return nil
+		}
+
+		// search for any socket
+		randomIndex, err := rand.Int(rand.Reader, big.NewInt(int64(len(session.wssConnections))))
+		if err != nil {
+			log.Print("error: failed to generate a random number, disconnecting")
+			session.wssConnectionsMu.RUnlock()
+			return nil
+		}
+
+		wsConn = session.wssConnections[randomIndex.Int64()]
+		session.wssConnectionsMu.RUnlock()
+
+		ct, err := Encrypt(wsConn.sharedSecret, message)
+		if err != nil {
+			log.Print("failed to encrypt: ", err)
+			continue
+		}
+
+		err = session.WebsocketWriteMessage(wsConn, append([]byte{0, byte(clientId)}, ct...))
+		if err != nil {
+			log.Print("error: still unable to write, retrying")
+			attempts++
+		} else {
+			log.Print("reassigned stream to #", randomIndex, " after ", attempts, " attempts")
+			break
+		}
+	}
+
+	return wsConn
 }
 
 func (session *Session) HandleTCPConnection(conn net.Conn, wsConn *WebsocketConnection, clientId int) {
+	defer conn.Close()
+	defer func() {
+		session.clientIDsMu.Lock()
+		_, exists := session.clientIDs[clientId]
+		if !exists {
+			log.Print("error: unable to delete entry: client id doesn't exist")
+			session.clientIDsMu.Unlock()
+			return
+		}
+		delete(session.clientIDs, clientId)
+		session.clientIDsMu.Unlock()
+		log.Print("cleanup entry")
+	}()
+
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := conn.Read(buf)
@@ -109,23 +186,38 @@ func (session *Session) HandleTCPConnection(conn net.Conn, wsConn *WebsocketConn
 
 		data := buf[:n]
 		// forward directly, but append data first
-		ct, err := Encrypt(wsConn.sharedSecret, data)
-		if err != nil {
-			log.Print("failed to encrypt: ", err)
-			continue
-		}
-		forwardData := append([]byte{0, byte(clientId)}, ct...)
 
-		session.WebsocketWriteMessage(wsConn, forwardData)
+		// reassign automatically
+		newConn := session.SendAndReassign(wsConn, clientId, data)
+		if newConn == nil {
+			log.Print("error: unable to write: nothing to reassign to, disconnecting")
+			return
+		}
+		wsConn = newConn
 
 	}
 }
 
+func (session *Session) DeleteWebsocketConn(conn *WebsocketConnection) {
+	session.wssConnectionsMu.Lock()
+	defer session.wssConnectionsMu.Unlock()
+	index := slices.Index(session.wssConnections, conn)
+	if index == -1 {
+		log.Print("error: unable to delete wss: index not found")
+		return
+	}
+	session.wssConnections = slices.Delete(session.wssConnections, index, index+1)
+	log.Print("deleted ", index, " from connections")
+}
+
 func (session *Session) HandleWebsocketLoop(conn *WebsocketConnection) {
+
+	log.Print("detected new websocket")
 
 	session.clientsActive.Add(1)
 	defer conn.connection.Close()
 	defer session.clientsActive.Add(-1)
+	defer session.DeleteWebsocketConn(conn)
 
 	scheme := kyber768.Scheme()
 
@@ -165,6 +257,11 @@ func (session *Session) HandleWebsocketLoop(conn *WebsocketConnection) {
 				continue
 			}
 
+			if len(message) < 2 {
+				log.Print("error: message too short")
+				continue
+			}
+
 			clientID := message[1]
 			tcpConn, exists := session.clientIDs[int(clientID)]
 			plaintext, err := Decrypt(conn.sharedSecret, message[2:])
@@ -176,10 +273,11 @@ func (session *Session) HandleWebsocketLoop(conn *WebsocketConnection) {
 			if !exists {
 				log.Print("unknown client id ", clientID, " attempting to dial")
 
-				host, hostError := GetDialTarget(messagePayload)
+				host, method, hostError := GetDialTarget(messagePayload)
 				if hostError != nil {
 					log.Print("error: unable to resolve dial destination: ", hostError)
 				}
+				isConnect := method == "CONNECT"
 				log.Print("dial attempt: ", host)
 				tcpConn, err := net.Dial("tcp", host)
 				if err != nil {
@@ -190,16 +288,19 @@ func (session *Session) HandleWebsocketLoop(conn *WebsocketConnection) {
 				go session.HandleTCPConnection(tcpConn, conn, int(clientID))
 				//log.Print("writing ", messagePayload)
 				//tcpConn.Write(messagePayload)
+				if isConnect {
+					msgEstablished := []byte("HTTP/1.1 200 Connection Established\r\n\r\n")
 
-				msgEstablished := []byte("HTTP/1.1 200 Connection Established\r\n\r\n")
-				ct, err := Encrypt(conn.sharedSecret, msgEstablished)
-				if err != nil {
-					log.Print("failed to encrypt handshake: ", err)
-					continue
-				}
-				err = session.WebsocketWriteMessage(conn, append([]byte{0, clientID}, ct...)) // apparently...
-				if err != nil {
-					log.Print("failed to write handshake: ", err)
+					// ensure that the pending handshake data still goes somewhere
+					// even if a websocket disconnects in the middle of all this logic
+					newConn := session.SendAndReassign(conn, int(clientID), msgEstablished)
+					if newConn == nil {
+						log.Print("error: cannot send: no reassign")
+						return
+					}
+					conn = newConn
+				} else {
+					tcpConn.Write(messagePayload)
 				}
 
 				session.clientIDsMu.Lock()
@@ -221,6 +322,23 @@ func (session *Session) HandleWebsocketLoop(conn *WebsocketConnection) {
 			log.Print("encryption handshake complete")
 			log.Print("shared secret length: ", len(sharedSecret))
 			conn.sharedSecret = sharedSecret
+		} else if message[0] == 2 {
+
+			clientID := message[1]
+			session.clientIDsMu.Lock()
+			tcpConn, exists := session.clientIDs[int(clientID)]
+			if !exists {
+				session.clientIDsMu.Unlock()
+				log.Print("error: attempt to disconnect tcp conn that doesn't exist")
+				continue
+			}
+			(*tcpConn).Close()
+			delete(session.clientIDs, int(clientID))
+			session.clientIDsMu.Unlock()
+			log.Print("deleted stream ", clientID)
+
+		} else {
+			log.Print("error: unrecognized message type: ", message[0])
 		}
 
 	}
@@ -316,6 +434,10 @@ func (server *Server) HandleWebsocketRequest(w http.ResponseWriter, r *http.Requ
 		connection: conn,
 		writeMutex: sync.Mutex{},
 	}
+
+	session.wssConnectionsMu.Lock()
+	session.wssConnections = append(session.wssConnections, connectionObject)
+	session.wssConnectionsMu.Unlock()
 
 	go session.HandleWebsocketLoop(connectionObject)
 }

@@ -4,9 +4,23 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"time"
 )
 
 func main() {
+
+	fmt.Println("--- Lightweight encrypted tunnel ---")
+	fmt.Println("info:")
+	fmt.Println(" - protocol: WSS/custom")
+	fmt.Println(" - encryption: TLS + custom encryption layer: post-quantum kyber768 handshake + AES-256-GCM post-quantum resistant")
+	fmt.Println(" - load distribution: relocatable streams, load-based dist: number of tcp connections on wss stream")
+	fmt.Println(" - failure handler: relocate stream, inbound/outbound can be on separate streams")
+	fmt.Println(" - multiplexing scaling: scale down: <6 socket/stream avg / scale up: >12 socket/stream avg")
+	fmt.Println(" - multiplexing layer: min 2, max ", NUMBER_OF_CONNECTIONS, " concurrent wss streams")
+	fmt.Println(" - limit: 256 concurrent tcp streams")
+
+	fmt.Println("\n\n\nLoading...")
+	time.Sleep(5 * time.Second)
 
 	connectionHandler := NewConnectionHandler()
 
@@ -20,7 +34,7 @@ func main() {
 	}
 	defer ln.Close()
 
-	fmt.Println("Proxy listening on 127.0.0.1:5000")
+	fmt.Println("listening on 127.0.0.1:5000")
 
 	for {
 		conn, err := ln.Accept()

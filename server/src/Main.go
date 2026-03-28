@@ -6,6 +6,7 @@ import (
 )
 
 func main() {
+
 	server := NewServer()
 	go server.HandleSessionsCleanup()
 	http.HandleFunc("/stream", server.HandleWebsocketRequest)

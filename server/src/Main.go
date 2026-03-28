@@ -12,5 +12,5 @@ func main() {
 	http.HandleFunc("/stream", server.HandleWebsocketRequest)
 	http.HandleFunc("/session/create", server.HandleSessionCreationRequest)
 	log.Print("serving")
-	http.ListenAndServe(":8682", nil)
+	http.ListenAndServe(":10000", nil)
 }

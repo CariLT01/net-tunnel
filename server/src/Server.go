@@ -3,7 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hkdf"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -28,6 +31,12 @@ type SessionCreationResponse struct {
 	Ok            bool    `json:"ok"`
 	SessionId     *int    `json:"sessionId"`
 	IdentityToken *string `json:"identityToken"`
+}
+
+type HandshakeProtocolCompletion struct {
+	ClientHelloReceived   bool
+	EncryptionEstablished bool
+	KeyConfirmed          bool
 }
 
 func (session *Session) WebsocketWriteMessage(conn *WebsocketConnection, message []byte) error {
@@ -243,6 +252,12 @@ func (session *Session) HandleWebsocketLoop(conn *WebsocketConnection) {
 
 	scheme := kyber768.Scheme()
 
+	handshakeCompletion := HandshakeProtocolCompletion{
+		ClientHelloReceived:   false,
+		EncryptionEstablished: false,
+		KeyConfirmed:          false,
+	}
+
 	ready := false
 	var sharedSecret []byte
 	publicKey, privateKey, err := kyber768.GenerateKeyPair(rand.Reader)
@@ -335,6 +350,17 @@ func (session *Session) HandleWebsocketLoop(conn *WebsocketConnection) {
 				(*(tcpConn.conn)).Write(messagePayload)
 			}
 		} else if message[0] == 3 {
+
+			if len(message) < 2 {
+				log.Print("received invalid message: too short")
+				continue
+			}
+
+			if !handshakeCompletion.ClientHelloReceived {
+				log.Print("error: protocol handshake failed: cannot establish encryption before client hello")
+				return
+			}
+
 			conn.handshakeTranscript = append(conn.handshakeTranscript, message...)
 			ciphertext := message[1:]
 			sharedSecret, err = scheme.Decapsulate(privateKey, ciphertext)
@@ -351,7 +377,19 @@ func (session *Session) HandleWebsocketLoop(conn *WebsocketConnection) {
 			log.Print("shared secret length: ", len(sharedSecret))
 			log.Print("transcript signature: ", transcriptSignature)
 			conn.sharedSecret = sharedSecret
+
+			handshakeCompletion.EncryptionEstablished = true
 		} else if message[0] == 2 {
+
+			if len(message) != 2 {
+				log.Print("received invalid message: wrong length")
+				continue
+			}
+
+			if !ready {
+				log.Print("cannot disconnect TCP connection with an unready connection")
+				continue
+			}
 
 			clientID := message[1]
 			session.clientIDsMu.Lock()
@@ -382,6 +420,64 @@ func (session *Session) HandleWebsocketLoop(conn *WebsocketConnection) {
 			payload := append([]byte{3}, publicKeyBin...)
 			conn.handshakeTranscript = append(conn.handshakeTranscript, payload...)
 			conn.connection.WriteMessage(websocket.BinaryMessage, payload)
+
+			handshakeCompletion.ClientHelloReceived = true
+		} else if message[0] == 5 {
+			log.Print("received key confirmation message")
+
+			if !(handshakeCompletion.ClientHelloReceived && handshakeCompletion.EncryptionEstablished) {
+				log.Print("cannot confirm key without client hello and encryption establishment")
+				return
+			}
+
+			transcriptHash := sha256.Sum256(conn.handshakeTranscript)
+			prk, err := hkdf.Extract(sha256.New, conn.sharedSecret, transcriptHash[:])
+			if err != nil {
+				log.Print("error: hkdf failed to extract: ", err)
+			}
+			confirmKey, err := hkdf.Expand(sha256.New, prk, "confirm", 32)
+			if err != nil {
+				log.Print("error: hkdf failed to expand: ", err)
+			}
+
+			// my message
+			mac := hmac.New(sha256.New, confirmKey)
+			mac.Write(conn.handshakeTranscript)
+			mac.Write([]byte("server"))
+
+			macSum := mac.Sum(nil)
+
+			// confirm client message
+			macClient := hmac.New(sha256.New, confirmKey)
+			macClient.Write(conn.handshakeTranscript)
+			macClient.Write([]byte("client"))
+
+			macClientSum := macClient.Sum(nil)
+
+			if !hmac.Equal(macClientSum, message[1:]) {
+				log.Print("error: key confirmation do not match, ending handshake")
+				return
+			} else {
+				log.Print("key confirmation matches")
+			}
+
+			// send back the confirmation
+			// 6 -- final message
+			payload := append([]byte{6}, macSum...)
+			conn.connection.WriteMessage(websocket.BinaryMessage, payload)
+			log.Print("wrote server Mac, handshake complete")
+
+			handshakeCompletion.KeyConfirmed = true
+
+			if !(handshakeCompletion.KeyConfirmed && handshakeCompletion.ClientHelloReceived && handshakeCompletion.EncryptionEstablished) {
+				log.Print("error: protocol handshake failed: one or more steps skipped")
+				return
+			} else {
+				log.Print("protocol established")
+			}
+
+			ready = true
+
 		} else {
 			log.Print("error: unrecognized message type: ", message[0])
 		}

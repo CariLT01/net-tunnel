@@ -1,6 +1,9 @@
 package main
 
 import (
+	"crypto/hkdf"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/json"
 	"io"
 	"log"
@@ -22,6 +25,12 @@ type SessionCreationResponse struct {
 	Ok            bool    `json:"ok"`
 	SessionId     *int    `json:"sessionId"`
 	IdentityToken *string `json:"identityToken"`
+}
+
+type HandshakeProtocolCompletion struct {
+	KyberHandshakeReceived  bool
+	SignatureReceived       bool
+	KeyConfirmationReceived bool
 }
 
 func (app *ConnectionHandler) connectToWebsocket() *ProxyWebsocketConnection {
@@ -89,6 +98,15 @@ func (app *ConnectionHandler) HandleWebsocketRead(conn *ProxyWebsocketConnection
 
 	scheme := kyber768.Scheme()
 
+	// step-by-step protocol
+	completion := HandshakeProtocolCompletion{
+		KyberHandshakeReceived:  false,
+		SignatureReceived:       false,
+		KeyConfirmationReceived: false,
+	}
+
+	var clientMac []byte
+
 	for {
 		_, message, err := conn.connection.ReadMessage()
 		if err != nil {
@@ -98,6 +116,12 @@ func (app *ConnectionHandler) HandleWebsocketRead(conn *ProxyWebsocketConnection
 		}
 
 		if message[0] == 0 { // means network packet
+
+			if !conn.ready {
+				log.Print("ignored packet: connection is not ready")
+				continue
+			}
+
 			// forward
 			clientId := message[1] // client ID
 
@@ -118,8 +142,14 @@ func (app *ConnectionHandler) HandleWebsocketRead(conn *ProxyWebsocketConnection
 
 			localConnection.localConnection.Write(plaintext)
 		} else if message[0] == 1 { // means client ready
-			log.Print("Connection reported ready")
-			log.Print("signature: ", message[1:])
+
+			if !(completion.KyberHandshakeReceived) {
+				log.Print("error: cannot verify signature without kyber handshake")
+				return
+			}
+
+			log.Print("Connection reported established, need to verify key match")
+			log.Printf("handshake transcript signature (EdDSA): %x\n", message[1:])
 			valid := VerifySignature(CERTIFICATE_PUBLIC_KEY, conn.handshakeTranscript, message[1:])
 			if !valid {
 				log.Print("--- MAN IN THE MIDDLE TAMPERING DETECTED ---")
@@ -127,8 +157,44 @@ func (app *ConnectionHandler) HandleWebsocketRead(conn *ProxyWebsocketConnection
 				return
 			}
 			log.Print("valid signature detected, trusting server")
-			conn.ready = true
+
+			// we need to verify key confirmation and transcript
+			transcriptHash := sha256.Sum256(conn.handshakeTranscript)
+			prk, err := hkdf.Extract(sha256.New, conn.sharedSecret, transcriptHash[:])
+			if err != nil {
+				log.Print("error: hkdf failed to extract: ", err)
+				return
+			}
+			confirmKey, err := hkdf.Expand(sha256.New, prk, "confirm", 32)
+			if err != nil {
+				log.Print("error: hkdf failed to expand: ", err)
+				return
+			}
+
+			log.Print("Derived key: ", len(confirmKey), " bytes")
+
+			mac := hmac.New(sha256.New, confirmKey)
+			mac.Write(conn.handshakeTranscript)
+			mac.Write([]byte("client"))
+			clientConfirm := mac.Sum(nil)
+
+			clientMac = clientConfirm
+
+			payload := append([]byte{5}, clientMac...) // 5 is key confirmation
+
+			conn.connection.WriteMessage(websocket.BinaryMessage, payload)
+
+			log.Print("sent confirmation to server: ", len(payload), " bytes")
+
+			completion.SignatureReceived = true
+
 		} else if message[0] == 2 { // server requested disconnect
+
+			if !conn.ready {
+				log.Print("error: cannot perform disconnect when connection is not ready")
+				continue
+			}
+
 			clientId := message[1]
 
 			app.localConnectionsMutex.Lock()
@@ -180,6 +246,53 @@ func (app *ConnectionHandler) HandleWebsocketRead(conn *ProxyWebsocketConnection
 			conn.writeMutex.Unlock()
 			log.Print("wrote ciphertext")
 
+			completion.KyberHandshakeReceived = true
+
+		} else if message[0] == 6 {
+
+			if !(completion.KyberHandshakeReceived && completion.SignatureReceived) {
+				log.Print("error: cannot confirm key before kyber handshake and signature validation")
+				return
+			}
+
+			serverMac := message[1:]
+
+			// derive key again
+			transcriptHash := sha256.Sum256(conn.handshakeTranscript)
+			prk, err := hkdf.Extract(sha256.New, conn.sharedSecret, transcriptHash[:])
+			if err != nil {
+				log.Print("error: hkdf failed to extract: ", err)
+			}
+			confirmKey, err := hkdf.Expand(sha256.New, prk, "confirm", 32)
+			if err != nil {
+				log.Print("error: hkdf failed to expand: ", err)
+			}
+
+			log.Print("Derived key: ", len(confirmKey), " bytes")
+
+			// write expected server mac
+			mac := hmac.New(sha256.New, confirmKey)
+			mac.Write(conn.handshakeTranscript)
+			mac.Write([]byte("server"))
+
+			if !hmac.Equal(serverMac, mac.Sum(nil)) {
+				log.Print("error: authenticity verification failed: HMAC mismatch, ending connection")
+				return
+			} else {
+				completion.KeyConfirmationReceived = true
+				log.Print("passed key confirmation check")
+
+				if !(completion.KeyConfirmationReceived == true && completion.KyberHandshakeReceived == true && completion.SignatureReceived == true) {
+					log.Print("error: invalid handshake. skipped one or more steps")
+					return
+				} else {
+					log.Print("protocol handshake complete")
+				}
+
+				conn.ready = true
+				log.Print("connection is ready")
+
+			}
 		} else {
 			log.Print("error: unrecognized message type: ", message[0])
 		}
@@ -198,8 +311,7 @@ func (app *ConnectionHandler) CreateSession() {
 	sessionManager := SessionManager{}
 	app.keys = sessionManager.FetchPublicKey()
 	challengeToken, nonce := app.powSolver.GetChallengeAndSolve(app.keys)
-	log.Print("challenge: ", challengeToken, " solution: ", nonce)
-	log.Print("TEST 1")
+	log.Print("solution: ", nonce)
 
 	u := url.URL{Scheme: SCHEME_HTTP, Host: RELAY_URL, Path: "/session/create"}
 	q := u.Query()
@@ -207,7 +319,6 @@ func (app *ConnectionHandler) CreateSession() {
 	q.Set("solution", strconv.FormatInt(nonce, 10))
 	u.RawQuery = q.Encode()
 	resp, err := http.Get(u.String())
-	log.Print("TEST 2")
 	if err != nil {
 		log.Fatal("Failed to create session: ", err)
 	}
@@ -216,14 +327,11 @@ func (app *ConnectionHandler) CreateSession() {
 	if err != nil {
 		log.Fatal("failed to read body: ", err)
 	}
-	log.Print("TEST 3")
 
 	// log.Print("body: " + string(body))
 
 	var r SessionCreationResponse
 	json.Unmarshal(body, &r)
-
-	log.Print(r)
 
 	if r.Ok == false {
 		log.Fatal("failed to create session: server returned ok=false")

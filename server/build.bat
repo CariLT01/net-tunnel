@@ -1,1 +1,1 @@
-go build -o server.exe ./src
+go build -v -o server.exe ./src

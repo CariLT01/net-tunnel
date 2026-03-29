@@ -1,1 +1,1 @@
-go build -ldflags="-s -w" -o client.exe ./src
+go build -ldflags="-s -w" -v -o client.exe ./src

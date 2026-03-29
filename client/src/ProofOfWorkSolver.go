@@ -136,7 +136,10 @@ func (solver *ProofOfWorkSolver) GetChallengeAndSolve(keys *Keys) (string, int64
 	if err != nil {
 		log.Fatal("error: failed to solve challenge: failed to get challenge: ", err)
 	}
-	log.Print("solving challenge: ", challengeToken)
+
+	challengeTokenHash := sha256.Sum256([]byte(challengeToken))
+
+	log.Printf("solving challenge: %x\n", challengeTokenHash)
 
 	nonce, err := solver.SolveFromToken(challengeToken)
 	if err != nil {

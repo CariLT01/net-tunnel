@@ -26,6 +26,7 @@ type PowTokenClaims struct {
 
 type PowEndpointResponse struct {
 	Ok             bool    `json:"ok"`
+	Message        string  `json:"message"`
 	ChallengeToken *string `json:"challengeToken"`
 }
 
@@ -118,7 +119,7 @@ func (solver *ProofOfWorkSolver) GetChallenge() (string, error) {
 	}
 
 	if !response.Ok {
-		return "", fmt.Errorf("Server failed to generate challenge")
+		return "", fmt.Errorf("Failed to generate challenge: %s", response.Message)
 	}
 
 	if response.ChallengeToken == nil {

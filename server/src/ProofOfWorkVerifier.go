@@ -2,7 +2,15 @@ package main
 
 import (
 	"crypto/ed25519"
+	"time"
+
+	"golang.org/x/time/rate"
 )
+
+type ClientChallengeRequestLimiter struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
 
 type ProofOfWorkVerifier struct {
 	privateKey *ed25519.PrivateKey
@@ -10,6 +18,9 @@ type ProofOfWorkVerifier struct {
 
 	usedSalts  map[string]struct{}
 	difficulty int
+
+	// PoW challenge limiters
+	challengeLimiters map[string]*ClientChallengeRequestLimiter
 }
 
 func NewProofOfWorkVerifier() *ProofOfWorkVerifier {
@@ -21,5 +32,7 @@ func NewProofOfWorkVerifier() *ProofOfWorkVerifier {
 		publicKey:  &publicKey,
 		usedSalts:  make(map[string]struct{}),
 		difficulty: 24,
+
+		challengeLimiters: make(map[string]*ClientChallengeRequestLimiter),
 	}
 }

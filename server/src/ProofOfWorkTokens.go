@@ -8,11 +8,14 @@ import (
 	"log"
 	"math"
 	"math/big"
+	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"golang.org/x/time/rate"
 )
 
 type PowTokenClaims struct {
@@ -24,6 +27,7 @@ type PowTokenClaims struct {
 
 type PowEndpointResponse struct {
 	Ok             bool    `json:"ok"`
+	Message        string  `json:"message"`
 	ChallengeToken *string `json:"challengeToken"`
 }
 
@@ -152,17 +156,61 @@ func (server *ProofOfWorkVerifier) VerifyProofOfWorkSolution(token string, nonce
 	}
 }
 
-func (server *ProofOfWorkVerifier) marshalPowEndpointJsonResponse(success bool, challengeToken *string) (string, error) {
-	res := PowEndpointResponse{Ok: success, ChallengeToken: challengeToken}
+func (server *ProofOfWorkVerifier) marshalPowEndpointJsonResponse(success bool, message string, challengeToken *string) string {
+	res := PowEndpointResponse{Ok: success, ChallengeToken: challengeToken, Message: message}
 	jsonBytes, err := json.Marshal(res)
 	if err != nil {
-		return "", err
+		return ""
 	}
 	jsonString := string(jsonBytes)
-	return jsonString, nil
+	return jsonString
+}
+
+func (server *ProofOfWorkVerifier) allow(clientIP string) bool {
+	cl, exists := server.challengeLimiters[clientIP]
+	if !exists {
+		cl = &ClientChallengeRequestLimiter{
+			limiter:  rate.NewLimiter(rate.Every(time.Minute/5), 5),
+			lastSeen: time.Now(),
+		}
+		server.challengeLimiters[clientIP] = cl
+	}
+
+	cl.lastSeen = time.Now()
+
+	return cl.limiter.Allow()
+}
+
+func (server *ProofOfWorkVerifier) getClientIP(r *http.Request) string {
+	// Check X-Forwarded-For
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		// can contain multiple IPs: client, proxy1, proxy2
+		ips := strings.Split(xff, ",")
+		return strings.TrimSpace(ips[0])
+	}
+
+	// Check X-Real-IP
+	if xrip := r.Header.Get("X-Real-IP"); xrip != "" {
+		return xrip
+	}
+
+	// Fallback to RemoteAddr
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return ip
 }
 
 func (server *ProofOfWorkVerifier) HandleProofOfWorkEndpoint(w http.ResponseWriter, r *http.Request) {
+
+	allowed := server.allow(server.getClientIP(r))
+	if !allowed {
+		log.Print("exceeded rate limit")
+		w.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprintln(w, server.marshalPowEndpointJsonResponse(false, "Rate limit exceeded, please try again later.", nil))
+		return
+	}
 
 	values := r.URL.Query()
 
@@ -170,37 +218,21 @@ func (server *ProofOfWorkVerifier) HandleProofOfWorkEndpoint(w http.ResponseWrit
 	if proofOfWorkAudience != "session-creation" {
 		log.Print("did not provide PoW audience")
 		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprintln(w, "{\"ok\":false}")
+		fmt.Fprintln(w, server.marshalPowEndpointJsonResponse(false, "No challenge audience provided", nil))
 		return
 	}
 
 	challengeToken, err := server.GenerateProofOfWorkChallenge("session-creation")
 	if err != nil {
 		log.Print("failed to generate proof of work challenge: ", err)
-		json, err := server.marshalPowEndpointJsonResponse(false, nil)
-		if err != nil {
-			log.Print("failed to generate json: ", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprintln(w, "{\"ok\":false}")
-			return
-		} else {
-			log.Print("failed to gen challenge: ", err)
-			w.WriteHeader(http.StatusOK)
-			fmt.Fprintln(w, json)
-			return
-		}
+		json := server.marshalPowEndpointJsonResponse(false, "Failed to generate a challenge", nil)
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintln(w, json)
 	} else {
-		json, err := server.marshalPowEndpointJsonResponse(true, &challengeToken)
-		if err != nil {
-			log.Print("failed to generate json: ", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprintln(w, "{\"ok\":false}")
-			return
-		} else {
-			log.Print("generated challenge token: ", challengeToken)
-			w.WriteHeader(http.StatusOK)
-			fmt.Fprintln(w, json)
-			return
-		}
+		json := server.marshalPowEndpointJsonResponse(true, "OK", &challengeToken)
+		log.Print("generated challenge token: ", challengeToken)
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintln(w, json)
+		return
 	}
 }

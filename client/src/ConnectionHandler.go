@@ -23,6 +23,7 @@ import (
 
 type SessionCreationResponse struct {
 	Ok            bool    `json:"ok"`
+	Message       string  `json:"message"`
 	SessionId     *int    `json:"sessionId"`
 	IdentityToken *string `json:"identityToken"`
 }
@@ -334,7 +335,7 @@ func (app *ConnectionHandler) CreateSession() {
 	json.Unmarshal(body, &r)
 
 	if r.Ok == false {
-		log.Fatal("failed to create session: server returned ok=false")
+		log.Fatal("failed to create session: ", r.Message)
 	}
 	if r.SessionId == nil {
 		log.Fatal("failed to create session. server returned ok=true but data=nil")

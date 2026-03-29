@@ -29,6 +29,7 @@ import (
 
 type SessionCreationResponse struct {
 	Ok            bool    `json:"ok"`
+	Message       string  `json:"message"`
 	SessionId     *int    `json:"sessionId"`
 	IdentityToken *string `json:"identityToken"`
 }
@@ -502,8 +503,8 @@ func (server *Server) HandleSessionsCleanup() {
 
 }
 
-func (server *Server) marshalSessionCreationResponse(ok bool, sessionId *int, identityToken *string) string {
-	res := SessionCreationResponse{Ok: ok, SessionId: sessionId, IdentityToken: identityToken}
+func (server *Server) marshalSessionCreationResponse(ok bool, message string, sessionId *int, identityToken *string) string {
+	res := SessionCreationResponse{Ok: ok, SessionId: sessionId, IdentityToken: identityToken, Message: message}
 	jsonBytes, err := json.Marshal(res)
 	if err != nil {
 		return ""
@@ -522,7 +523,7 @@ func (server *Server) HandleSessionCreationRequest(w http.ResponseWriter, r *htt
 	if !server.verifier.VerifyProofOfWorkSolution(challengeToken, solution, "session-creation") {
 		log.Print("client provided invalid proof of work challenge or solution")
 		w.WriteHeader(http.StatusUnauthorized)
-		fmt.Fprintln(w, "Unauthorized: invalid challenge or solution")
+		fmt.Fprintln(w, server.marshalSessionCreationResponse(false, "Invalid proof of work token or solution", nil, nil))
 		return
 	}
 
@@ -532,7 +533,7 @@ func (server *Server) HandleSessionCreationRequest(w http.ResponseWriter, r *htt
 		if err != nil {
 			log.Print("error: failed to generate a random number lol")
 			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprintln(w, server.marshalSessionCreationResponse(false, nil, nil))
+			fmt.Fprintln(w, server.marshalSessionCreationResponse(false, "Failed to create session", nil, nil))
 			return
 		} else {
 			// create session
@@ -544,7 +545,7 @@ func (server *Server) HandleSessionCreationRequest(w http.ResponseWriter, r *htt
 				if attempts >= 5000 {
 					log.Print("error: cannot create session: map too saturated")
 					w.WriteHeader(http.StatusServiceUnavailable)
-					fmt.Fprintln(w, server.marshalSessionCreationResponse(false, nil, nil))
+					fmt.Fprintln(w, server.marshalSessionCreationResponse(false, "Too many active sessions. Cannot create a new session.", nil, nil))
 					return
 				}
 				continue
@@ -554,7 +555,7 @@ func (server *Server) HandleSessionCreationRequest(w http.ResponseWriter, r *htt
 			if err != nil {
 				log.Print("error: failed to create identity token: ", err)
 				w.WriteHeader(http.StatusInternalServerError)
-				fmt.Fprintln(w, server.marshalSessionCreationResponse(false, nil, nil))
+				fmt.Fprintln(w, server.marshalSessionCreationResponse(false, "Failed to issue an identity token", nil, nil))
 				return
 			}
 
@@ -565,7 +566,7 @@ func (server *Server) HandleSessionCreationRequest(w http.ResponseWriter, r *htt
 			w.WriteHeader(http.StatusOK)
 			sessionIdInt := int(sessionId.Int64())
 			log.Print("creating session id: ", sessionIdInt)
-			fmt.Fprintln(w, server.marshalSessionCreationResponse(true, &sessionIdInt, &identityToken))
+			fmt.Fprintln(w, server.marshalSessionCreationResponse(true, "OK", &sessionIdInt, &identityToken))
 
 			return
 

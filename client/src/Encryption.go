@@ -3,9 +3,12 @@ package main
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"io"
+	"log"
 )
 
 func Encrypt(key, plaintext []byte) ([]byte, error) {
@@ -61,4 +64,15 @@ func Decrypt(key, ciphertext []byte) ([]byte, error) {
 	}
 
 	return plaintext, nil
+}
+
+func VerifySignature(pubKey string, message, signature []byte) bool {
+	if pubKey == "" {
+		log.Fatal("no public key")
+	}
+	pubKeyBytes, err := base64.StdEncoding.DecodeString(pubKey)
+	if err != nil {
+		log.Fatal("failed to decode public key base64")
+	}
+	return ed25519.Verify(pubKeyBytes, message, signature)
 }

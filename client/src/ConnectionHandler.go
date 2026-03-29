@@ -108,6 +108,14 @@ func (app *ConnectionHandler) HandleWebsocketRead(conn *ProxyWebsocketConnection
 			localConnection.localConnection.Write(plaintext)
 		} else if message[0] == 1 { // means client ready
 			log.Print("Connection reported ready")
+			log.Print("signature: ", message[1:])
+			valid := VerifySignature(CERTIFICATE_PUBLIC_KEY, conn.handshakeTranscript, message[1:])
+			if !valid {
+				log.Print("--- MAN IN THE MIDDLE TAMPERING DETECTED ---")
+				log.Fatal("Ending all connections immediately")
+				return
+			}
+			log.Print("valid signature detected, trusting server")
 			conn.ready = true
 		} else if message[0] == 2 { // server requested disconnect
 			clientId := message[1]
@@ -136,8 +144,9 @@ func (app *ConnectionHandler) HandleWebsocketRead(conn *ProxyWebsocketConnection
 			delete(app.clientConnectionIDs, int(clientId))
 			app.clientConnectionIDsRWMutex.Unlock()
 			log.Print("deleted client id entry: ", clientId)
-		} else if message[0] == 3 {
+		} else if message[0] == 3 { // means handshake data
 			log.Print("received handshake")
+			conn.handshakeTranscript = append(conn.handshakeTranscript, message...)
 			publicKeyBin := message[1:]
 			publicKey, err := scheme.UnmarshalBinaryPublicKey(publicKeyBin)
 			if err != nil {
@@ -154,7 +163,9 @@ func (app *ConnectionHandler) HandleWebsocketRead(conn *ProxyWebsocketConnection
 			conn.sharedSecret = sharedSecret
 
 			conn.writeMutex.Lock()
-			conn.connection.WriteMessage(websocket.BinaryMessage, append([]byte{3}, ciphertext...))
+			payload := append([]byte{3}, ciphertext...)
+			conn.connection.WriteMessage(websocket.BinaryMessage, payload)
+			conn.handshakeTranscript = append(conn.handshakeTranscript, payload...)
 			conn.writeMutex.Unlock()
 			log.Print("wrote ciphertext")
 
@@ -185,7 +196,7 @@ func (app *ConnectionHandler) CreateSession() {
 	q.Set("solution", strconv.FormatInt(nonce, 10))
 	u.RawQuery = q.Encode()
 	resp, err := http.Get(u.String())
-	log.Print("TEST 3")
+	log.Print("TEST 2")
 	if err != nil {
 		log.Fatal("Failed to create session: ", err)
 	}
@@ -194,9 +205,9 @@ func (app *ConnectionHandler) CreateSession() {
 	if err != nil {
 		log.Fatal("failed to read body: ", err)
 	}
-	log.Print("TEST 2")
+	log.Print("TEST 3")
 
-	log.Print("body: " + string(body))
+	// log.Print("body: " + string(body))
 
 	var r SessionCreationResponse
 	json.Unmarshal(body, &r)
@@ -221,7 +232,7 @@ func (app *ConnectionHandler) CreateSession() {
 
 	app.sessionId = *r.SessionId
 	app.identityToken = *r.IdentityToken
-	log.Print("identity token: ", app.identityToken)
+	log.Print("identity token (len): ", len(app.identityToken))
 	log.Print("created session id: ", app.sessionId)
 }
 
@@ -401,7 +412,6 @@ func (app *ConnectionHandler) HandleNewConnection(conn net.Conn) {
 	app.localConnectionsMutex.Unlock()
 
 	log.Print("reserved client id: ", clientId)
-	app.clientConnectionIDsRWMutex.Lock()
 
 	buf := make([]byte, 32*1024)
 	for {

@@ -259,7 +259,9 @@ func (session *Session) HandleWebsocketLoop(conn *WebsocketConnection) {
 
 	// send public key
 	log.Print("writing public key")
-	conn.connection.WriteMessage(websocket.BinaryMessage, append([]byte{3}, publicKeyBin...))
+	payload := append([]byte{3}, publicKeyBin...)
+	conn.handshakeTranscript = append(conn.handshakeTranscript, payload...)
+	conn.connection.WriteMessage(websocket.BinaryMessage, payload)
 
 	//server.WebsocketWriteMessage(conn, []byte{1}) // send READY status immediately
 
@@ -345,16 +347,21 @@ func (session *Session) HandleWebsocketLoop(conn *WebsocketConnection) {
 				(*(tcpConn.conn)).Write(messagePayload)
 			}
 		} else if message[0] == 3 {
+			conn.handshakeTranscript = append(conn.handshakeTranscript, message...)
 			ciphertext := message[1:]
 			sharedSecret, err = scheme.Decapsulate(privateKey, ciphertext)
 			if err != nil {
 				log.Print("error: handshake failed: decapsulate failed: ", err)
 				return
 			}
-			conn.connection.WriteMessage(websocket.BinaryMessage, []byte{1})
+
+			transcriptSignature := Sign(CERTIFICATE_PRIVATE_KEY, conn.handshakeTranscript)
+
+			conn.connection.WriteMessage(websocket.BinaryMessage, append([]byte{1}, transcriptSignature...))
 			ready = true
 			log.Print("encryption handshake complete")
 			log.Print("shared secret length: ", len(sharedSecret))
+			log.Print("transcript signature: ", transcriptSignature)
 			conn.sharedSecret = sharedSecret
 		} else if message[0] == 2 {
 

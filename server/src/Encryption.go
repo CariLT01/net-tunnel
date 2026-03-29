@@ -3,9 +3,12 @@ package main
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"io"
+	"log"
 )
 
 func Encrypt(key, plaintext []byte) ([]byte, error) {
@@ -61,4 +64,15 @@ func Decrypt(key, ciphertext []byte) ([]byte, error) {
 	}
 
 	return plaintext, nil
+}
+
+func Sign(key string, message []byte) []byte {
+	if key == "" {
+		log.Fatal("Unable to sign: empty key: ", key)
+	}
+	keyBytes, err := base64.StdEncoding.DecodeString(key)
+	if err != nil {
+		log.Fatal("secret is not valid base64")
+	}
+	return ed25519.Sign(ed25519.PrivateKey(keyBytes), message)
 }

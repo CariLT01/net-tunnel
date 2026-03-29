@@ -21,6 +21,8 @@ type ProxyWebsocketConnection struct {
 	writeMutex     sync.Mutex
 	connectedCount atomic.Int64
 	sharedSecret   []byte
+
+	handshakeTranscript []byte
 }
 
 type ConnectionHandler struct {

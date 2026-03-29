@@ -14,6 +14,8 @@ type WebsocketConnection struct {
 	connection   *websocket.Conn
 	writeMutex   sync.Mutex
 	sharedSecret []byte
+
+	handshakeTranscript []byte
 }
 
 type TCPConnection struct {

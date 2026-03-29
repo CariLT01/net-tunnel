@@ -1,2 +1,7 @@
 /client/client.exe
 /server/server.exe
+
+# Ignore public/private keypair
+
+/server/src/Key.go
+/client/src/Key.go

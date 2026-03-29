@@ -251,18 +251,6 @@ func (session *Session) HandleWebsocketLoop(conn *WebsocketConnection) {
 		return
 	}
 
-	publicKeyBin, err := publicKey.MarshalBinary()
-	if err != nil {
-		log.Print("error: unable to pack public key", err)
-		return
-	}
-
-	// send public key
-	log.Print("writing public key")
-	payload := append([]byte{3}, publicKeyBin...)
-	conn.handshakeTranscript = append(conn.handshakeTranscript, payload...)
-	conn.connection.WriteMessage(websocket.BinaryMessage, payload)
-
 	//server.WebsocketWriteMessage(conn, []byte{1}) // send READY status immediately
 
 	for {
@@ -378,6 +366,22 @@ func (session *Session) HandleWebsocketLoop(conn *WebsocketConnection) {
 			session.clientIDsMu.Unlock()
 			log.Print("deleted stream ", clientID)
 
+		} else if message[0] == 4 {
+
+			log.Print("received client hello nonce")
+			conn.handshakeTranscript = append(conn.handshakeTranscript, message...)
+
+			publicKeyBin, err := publicKey.MarshalBinary()
+			if err != nil {
+				log.Print("error: unable to pack public key", err)
+				return
+			}
+
+			// send public key
+			log.Print("writing public key")
+			payload := append([]byte{3}, publicKeyBin...)
+			conn.handshakeTranscript = append(conn.handshakeTranscript, payload...)
+			conn.connection.WriteMessage(websocket.BinaryMessage, payload)
 		} else {
 			log.Print("error: unrecognized message type: ", message[0])
 		}

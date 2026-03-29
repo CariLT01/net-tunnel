@@ -76,6 +76,17 @@ func (app *ConnectionHandler) HandleWebsocketRead(conn *ProxyWebsocketConnection
 	defer app.onSocketDied(conn)
 	defer app.DeleteWebsocket(conn)
 
+	// first send message 4, which is clientHello
+	nonce, err := GenerateSecureSecret()
+	if err != nil {
+		log.Print("error: failed to generate nonce")
+		return
+	}
+	payloadNonce := append([]byte{4}, nonce...)
+	app.SocketWriteMessage(conn, payloadNonce)
+	conn.handshakeTranscript = append(conn.handshakeTranscript, payloadNonce...)
+	log.Print("sent client hello nonce")
+
 	scheme := kyber768.Scheme()
 
 	for {

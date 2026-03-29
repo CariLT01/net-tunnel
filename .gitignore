@@ -5,3 +5,6 @@
 
 /client/src/Key.go
 /KEYS.txt
+
+# Ignore config
+/client/clientConfig.json

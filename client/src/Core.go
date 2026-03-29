@@ -16,11 +16,13 @@ type ProxyLocalConnection struct {
 }
 
 type ProxyWebsocketConnection struct {
-	ready          bool
-	connection     *websocket.Conn
-	writeMutex     sync.Mutex
-	connectedCount atomic.Int64
-	sharedSecret   []byte
+	ready                     atomic.Bool
+	handshakeSucceeded        atomic.Bool
+	intentionallyDisconnected atomic.Bool
+	connection                *websocket.Conn
+	writeMutex                sync.Mutex
+	connectedCount            atomic.Int64
+	sharedSecret              []byte
 
 	handshakeTranscript []byte
 }
@@ -37,7 +39,8 @@ type ConnectionHandler struct {
 	powSolver     *ProofOfWorkSolver
 	identityToken string
 
-	keys *Keys
+	keys   *Keys
+	config *ConfigurationManager
 }
 
 type ProxyClient struct {
@@ -56,5 +59,6 @@ func NewConnectionHandler() *ConnectionHandler {
 		sessionId:     -1,
 		powSolver:     &ProofOfWorkSolver{},
 		identityToken: "",
+		config:        NewConfigManager(),
 	}
 }

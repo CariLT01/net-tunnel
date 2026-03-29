@@ -27,8 +27,8 @@ type KeysEndpointResponse struct {
 	Keys *KeysField `json:"keys"`
 }
 
-func (solver *SessionManager) FetchPublicKey() *Keys {
-	u := url.URL{Scheme: SCHEME_HTTP, Host: RELAY_URL, Path: "/keys"}
+func (solver *SessionManager) FetchPublicKey(config *ConfigurationManager) *Keys {
+	u := url.URL{Scheme: config.config.HttpScheme, Host: config.config.VpnServer, Path: "/keys"}
 	resp, err := http.Get(u.String())
 	if err != nil {
 		log.Fatal("Failed to fetch public keys: ", err)

@@ -100,8 +100,8 @@ func (solver *ProofOfWorkSolver) SolveFromToken(token string) (int64, error) {
 	return nonce, nil
 }
 
-func (solver *ProofOfWorkSolver) GetChallenge() (string, error) {
-	u := url.URL{Scheme: SCHEME_HTTP, Host: RELAY_URL, Path: "/challenge/generate"}
+func (solver *ProofOfWorkSolver) GetChallenge(config *ConfigurationManager) (string, error) {
+	u := url.URL{Scheme: config.config.HttpScheme, Host: config.config.VpnServer, Path: "/challenge/generate"}
 	q := u.Query()
 	q.Set("audience", "session-creation")
 	u.RawQuery = q.Encode()
@@ -130,10 +130,10 @@ func (solver *ProofOfWorkSolver) GetChallenge() (string, error) {
 
 }
 
-func (solver *ProofOfWorkSolver) GetChallengeAndSolve(keys *Keys) (string, int64) {
+func (solver *ProofOfWorkSolver) GetChallengeAndSolve(config *ConfigurationManager, keys *Keys) (string, int64) {
 	log.Print("fetching public key")
 	solver.publicKey = keys.challengeKey
-	challengeToken, err := solver.GetChallenge()
+	challengeToken, err := solver.GetChallenge(config)
 	if err != nil {
 		log.Fatal("error: failed to solve challenge: failed to get challenge: ", err)
 	}

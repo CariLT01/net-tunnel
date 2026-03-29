@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"math/rand/v2"
@@ -34,8 +35,8 @@ type HandshakeProtocolCompletion struct {
 	KeyConfirmationReceived bool
 }
 
-func (app *ConnectionHandler) connectToWebsocket() *ProxyWebsocketConnection {
-	u := url.URL{Scheme: SCHEME_WS, Host: RELAY_URL, Path: "/stream"}
+func (app *ConnectionHandler) connectToWebsocket() (*ProxyWebsocketConnection, error) {
+	u := url.URL{Scheme: app.config.config.WebsocketScheme, Host: app.config.config.VpnServer, Path: "/stream"}
 	q := u.Query()
 	q.Set("sessionId", strconv.Itoa(app.sessionId))
 
@@ -45,28 +46,34 @@ func (app *ConnectionHandler) connectToWebsocket() *ProxyWebsocketConnection {
 	u.RawQuery = q.Encode()
 	c, _, err := websocket.DefaultDialer.Dial(u.String(), headers)
 	if err != nil {
-		log.Fatal("Failed to dial: ", err)
+		log.Print("Failed to dial: ", err)
+		return nil, fmt.Errorf("Failed to dial target: %s", err)
 	}
 
 	connectionObj := &ProxyWebsocketConnection{
-		ready:          false,
-		connection:     c,
-		connectedCount: atomic.Int64{},
-		writeMutex:     sync.Mutex{},
+		ready:                     atomic.Bool{},
+		handshakeSucceeded:        atomic.Bool{},
+		intentionallyDisconnected: atomic.Bool{},
+		connection:                c,
+		connectedCount:            atomic.Int64{},
+		writeMutex:                sync.Mutex{},
 	}
 
 	app.wssConnectionsMutex.Lock()
 	app.wssConnections = append(app.wssConnections, connectionObj)
 	app.wssConnectionsMutex.Unlock()
 
-	return connectionObj
+	return connectionObj, nil
 }
 
 func (app *ConnectionHandler) onSocketDied(conn *ProxyWebsocketConnection) {
-	if conn.ready {
+	if conn.handshakeSucceeded.Load() == true && conn.intentionallyDisconnected.Load() == false {
 		// only if it was actually ready
 		// don't want to be stuck in a never-ending loop of unsuccessful sockets
+		log.Print("attempting to reconnect")
 		app.CreateWebSocket()
+	} else {
+		log.Print("not attempting to reconnect. handshake failed or intentionally disconnected")
 	}
 }
 
@@ -112,13 +119,13 @@ func (app *ConnectionHandler) HandleWebsocketRead(conn *ProxyWebsocketConnection
 		_, message, err := conn.connection.ReadMessage()
 		if err != nil {
 			log.Print("Proxy Websocket Disconnected")
-			conn.ready = false
+			conn.ready.Store(false)
 			break
 		}
 
 		if message[0] == 0 { // means network packet
 
-			if !conn.ready {
+			if !conn.ready.Load() {
 				log.Print("ignored packet: connection is not ready")
 				continue
 			}
@@ -191,7 +198,7 @@ func (app *ConnectionHandler) HandleWebsocketRead(conn *ProxyWebsocketConnection
 
 		} else if message[0] == 2 { // server requested disconnect
 
-			if !conn.ready {
+			if !conn.ready.Load() {
 				log.Print("error: cannot perform disconnect when connection is not ready")
 				continue
 			}
@@ -290,8 +297,10 @@ func (app *ConnectionHandler) HandleWebsocketRead(conn *ProxyWebsocketConnection
 					log.Print("protocol handshake complete")
 				}
 
-				conn.ready = true
+				conn.ready.Store(true)
 				log.Print("connection is ready")
+				conn.handshakeSucceeded.Store(true)
+				log.Print("marked handshake succeeded")
 
 			}
 		} else {
@@ -300,9 +309,13 @@ func (app *ConnectionHandler) HandleWebsocketRead(conn *ProxyWebsocketConnection
 	}
 }
 
-func (app *ConnectionHandler) CreateWebSocket() {
-	socketObj := app.connectToWebsocket()
+func (app *ConnectionHandler) CreateWebSocket() error {
+	socketObj, err := app.connectToWebsocket()
+	if err != nil {
+		return fmt.Errorf("Failed to create WebSocket: %s", err)
+	}
 	go app.HandleWebsocketRead(socketObj)
+	return nil
 }
 
 func (app *ConnectionHandler) CreateSession() {
@@ -310,11 +323,11 @@ func (app *ConnectionHandler) CreateSession() {
 	// solve pow
 
 	sessionManager := SessionManager{}
-	app.keys = sessionManager.FetchPublicKey()
-	challengeToken, nonce := app.powSolver.GetChallengeAndSolve(app.keys)
+	app.keys = sessionManager.FetchPublicKey(app.config)
+	challengeToken, nonce := app.powSolver.GetChallengeAndSolve(app.config, app.keys)
 	log.Print("solution: ", nonce)
 
-	u := url.URL{Scheme: SCHEME_HTTP, Host: RELAY_URL, Path: "/session/create"}
+	u := url.URL{Scheme: app.config.config.HttpScheme, Host: app.config.config.VpnServer, Path: "/session/create"}
 	q := u.Query()
 	q.Set("challengeToken", challengeToken)
 	q.Set("solution", strconv.FormatInt(nonce, 10))
@@ -358,11 +371,28 @@ func (app *ConnectionHandler) CreateSession() {
 
 func (app *ConnectionHandler) Initialize() {
 
+	log.Print("loading config")
+	// Load config, save it to ensure the file exists
+	app.config.LoadConfig()
+	app.config.SaveConfig()
+
 	app.CreateSession()
 
-	for i := 0; i < 2; i++ {
-		app.CreateWebSocket()
+	streamsFailed := 0
+	streamsToCreate := 2
+
+	for i := 0; i < streamsToCreate; i++ {
+		err := app.CreateWebSocket()
+		if err != nil {
+			log.Print("error: Failed to create stream: ", err)
+			streamsFailed++
+			continue
+		}
 		log.Print("Connection #", i, " created")
+	}
+
+	if streamsFailed >= streamsToCreate {
+		log.Fatal("fatal: cannot connect: no connections can be established")
 	}
 
 	go app.MultiplexingScalingLoop()
@@ -414,7 +444,7 @@ func (app *ConnectionHandler) AssignConnectionHandler() int {
 	app.wssConnectionsMutex.RLock()
 
 	for index, wssConnection := range app.wssConnections {
-		if int(wssConnection.connectedCount.Load()) < leastWebsocketCount && wssConnection.ready == true {
+		if int(wssConnection.connectedCount.Load()) < leastWebsocketCount && wssConnection.ready.Load() {
 			leastWebsocketCountIndex = index
 			leastWebsocketCount = int(wssConnection.connectedCount.Load())
 		}
@@ -473,6 +503,8 @@ func (app *ConnectionHandler) MultiplexingScalingLoop() {
 				continue
 			}
 
+			log.Print("set intentionally disconnected = true")
+			leastWorthySocket.intentionallyDisconnected.Store(true)
 			leastWorthySocket.connection.Close()
 		} else if connectionsPerSocketAvg > 12 {
 			log.Print("attempting to upscale")

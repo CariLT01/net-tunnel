@@ -20,7 +20,7 @@ var CONFIG_PATH = "clientConfig.json"
 
 func NewConfig() *ClientConfig {
 	return &ClientConfig{
-		VpnServer:       "net-tunnel.onrender.com",
+		VpnServer:       "data-router-239.onrender.com",
 		HttpScheme:      "https",
 		WebsocketScheme: "wss",
 	}

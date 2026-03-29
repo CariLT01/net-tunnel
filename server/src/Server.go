@@ -2,7 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math"
@@ -18,7 +21,14 @@ import (
 
 	"github.com/cloudflare/circl/kem/kyber/kyber768"
 	"github.com/gorilla/websocket"
+	"golang.org/x/time/rate"
 )
+
+type SessionCreationResponse struct {
+	Ok            bool    `json:"ok"`
+	SessionId     *int    `json:"sessionId"`
+	IdentityToken *string `json:"identityToken"`
+}
 
 func (session *Session) WebsocketWriteMessage(conn *WebsocketConnection, message []byte) error {
 	conn.writeMutex.Lock()
@@ -153,8 +163,8 @@ func (session *Session) SendAndReassign(wsConn *WebsocketConnection, clientId in
 	return wsConn
 }
 
-func (session *Session) HandleTCPConnection(conn net.Conn, wsConn *WebsocketConnection, clientId int) {
-	defer conn.Close()
+func (session *Session) HandleTCPConnection(conn *TCPConnection, wsConn *WebsocketConnection, clientId int) {
+	defer (*(conn.conn)).Close()
 	defer func() {
 		session.clientIDsMu.Lock()
 		_, exists := session.clientIDs[clientId]
@@ -170,7 +180,7 @@ func (session *Session) HandleTCPConnection(conn net.Conn, wsConn *WebsocketConn
 
 	buf := make([]byte, 32*1024)
 	for {
-		n, err := conn.Read(buf)
+		n, err := (*(conn.conn)).Read(buf)
 		if err != nil {
 			log.Print("detected tcp socket closed. error: ", err)
 			if clientId != -1 {
@@ -188,6 +198,10 @@ func (session *Session) HandleTCPConnection(conn net.Conn, wsConn *WebsocketConn
 		// forward directly, but append data first
 
 		// reassign automatically
+
+		// first wait
+		session.limiterWait(session.outboundLimiter, len(data))
+
 		newConn := session.SendAndReassign(wsConn, clientId, data)
 		if newConn == nil {
 			log.Print("error: unable to write: nothing to reassign to, disconnecting")
@@ -208,6 +222,14 @@ func (session *Session) DeleteWebsocketConn(conn *WebsocketConnection) {
 	}
 	session.wssConnections = slices.Delete(session.wssConnections, index, index+1)
 	log.Print("deleted ", index, " from connections")
+}
+
+func (session *Session) limiterWait(limiter *rate.Limiter, n int) error {
+
+	if err := limiter.WaitN(context.Background(), n); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (session *Session) HandleWebsocketLoop(conn *WebsocketConnection) {
@@ -285,14 +307,23 @@ func (session *Session) HandleWebsocketLoop(conn *WebsocketConnection) {
 					continue
 				}
 				log.Print("connection dialed successfully")
-				go session.HandleTCPConnection(tcpConn, conn, int(clientID))
+
+				tcpConnObj := &TCPConnection{
+					conn: &tcpConn,
+				}
+
+				go session.HandleTCPConnection(tcpConnObj, conn, int(clientID))
 				//log.Print("writing ", messagePayload)
 				//tcpConn.Write(messagePayload)
+
 				if isConnect {
 					msgEstablished := []byte("HTTP/1.1 200 Connection Established\r\n\r\n")
+					// act as if the tcp connection sent this data
+					session.limiterWait(session.outboundLimiter, len(msgEstablished))
 
 					// ensure that the pending handshake data still goes somewhere
 					// even if a websocket disconnects in the middle of all this logic
+
 					newConn := session.SendAndReassign(conn, int(clientID), msgEstablished)
 					if newConn == nil {
 						log.Print("error: cannot send: no reassign")
@@ -304,11 +335,14 @@ func (session *Session) HandleWebsocketLoop(conn *WebsocketConnection) {
 				}
 
 				session.clientIDsMu.Lock()
-				session.clientIDs[int(clientID)] = &tcpConn
+				session.clientIDs[int(clientID)] = tcpConnObj
 				session.clientIDsMu.Unlock()
 			} else {
 				// log.Print("received ", len(message)-2, " from websocket")
-				(*tcpConn).Write(messagePayload)
+
+				// rate limiting
+				session.limiterWait(session.outboundLimiter, len(messagePayload))
+				(*(tcpConn.conn)).Write(messagePayload)
 			}
 		} else if message[0] == 3 {
 			ciphertext := message[1:]
@@ -332,7 +366,7 @@ func (session *Session) HandleWebsocketLoop(conn *WebsocketConnection) {
 				log.Print("error: attempt to disconnect tcp conn that doesn't exist")
 				continue
 			}
-			(*tcpConn).Close()
+			(*(tcpConn.conn)).Close()
 			delete(session.clientIDs, int(clientID))
 			session.clientIDsMu.Unlock()
 			log.Print("deleted stream ", clientID)
@@ -361,15 +395,37 @@ func (server *Server) HandleSessionsCleanup() {
 
 }
 
+func (server *Server) marshalSessionCreationResponse(ok bool, sessionId *int, identityToken *string) string {
+	res := SessionCreationResponse{Ok: ok, SessionId: sessionId, IdentityToken: identityToken}
+	jsonBytes, err := json.Marshal(res)
+	if err != nil {
+		return ""
+	} else {
+		return string(jsonBytes)
+	}
+}
+
 func (server *Server) HandleSessionCreationRequest(w http.ResponseWriter, r *http.Request) {
 	// generate a random session id
+	values := r.URL.Query()
+
+	challengeToken := values.Get("challengeToken")
+	solution := values.Get("solution")
+
+	if !server.verifier.VerifyProofOfWorkSolution(challengeToken, solution, "session-creation") {
+		log.Print("client provided invalid proof of work challenge or solution")
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprintln(w, "Unauthorized: invalid challenge or solution")
+		return
+	}
+
 	attempts := 0
 	for {
 		sessionId, err := rand.Int(rand.Reader, big.NewInt(math.MaxInt32))
 		if err != nil {
 			log.Print("error: failed to generate a random number lol")
 			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprintln(w, "{\"ok\":false}")
+			fmt.Fprintln(w, server.marshalSessionCreationResponse(false, nil, nil))
 			return
 		} else {
 			// create session
@@ -381,17 +437,28 @@ func (server *Server) HandleSessionCreationRequest(w http.ResponseWriter, r *htt
 				if attempts >= 5000 {
 					log.Print("error: cannot create session: map too saturated")
 					w.WriteHeader(http.StatusServiceUnavailable)
-					fmt.Fprintln(w, "{\"ok\":false}")
+					fmt.Fprintln(w, server.marshalSessionCreationResponse(false, nil, nil))
 					return
 				}
 				continue
 			}
+
+			identityToken, err := server.identityProvider.CreateIdentityToken(int(sessionId.Int64()))
+			if err != nil {
+				log.Print("error: failed to create identity token: ", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				fmt.Fprintln(w, server.marshalSessionCreationResponse(false, nil, nil))
+				return
+			}
+
 			session := NewSession()
 			server.sessionsMu.Lock()
 			server.sessions[int(sessionId.Int64())] = session
 			server.sessionsMu.Unlock()
 			w.WriteHeader(http.StatusOK)
-			fmt.Fprintln(w, "{\"ok\":true,\"data\":"+sessionId.String()+"}")
+			sessionIdInt := int(sessionId.Int64())
+			log.Print("creating session id: ", sessionIdInt)
+			fmt.Fprintln(w, server.marshalSessionCreationResponse(true, &sessionIdInt, &identityToken))
 
 			return
 
@@ -401,23 +468,33 @@ func (server *Server) HandleSessionCreationRequest(w http.ResponseWriter, r *htt
 }
 
 func (server *Server) HandleWebsocketRequest(w http.ResponseWriter, r *http.Request) {
-	conn, err := server.upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Print("error: failed to upgrade connection: ", err)
-		return
-	}
 
 	values := r.URL.Query()
 	sessionId := values.Get("sessionId")
 	if sessionId == "" {
 		log.Print("client did not provide session id")
-		conn.Close()
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintln(w, "Session ID not provided")
 		return
 	}
 	sessionIdInt, err := strconv.Atoi(sessionId)
 	if err != nil {
 		log.Print("client did not provide integer session id")
-		conn.Close()
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintln(w, "Provided session ID is not an integer")
+		return
+	}
+
+	identity := ""
+
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		identity = strings.TrimPrefix(auth, "Bearer ")
+	}
+
+	if !server.identityProvider.VerifyIdentityToken(identity, sessionIdInt) {
+		log.Print("invalid identity token or identity token does not match session")
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprintln(w, "Provided identity token is invalid or is not for this session")
 		return
 	}
 
@@ -426,7 +503,24 @@ func (server *Server) HandleWebsocketRequest(w http.ResponseWriter, r *http.Requ
 	server.sessionsMu.RUnlock()
 	if !exists {
 		log.Print("session does not exist")
-		conn.Close()
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprintln(w, "Session does not exist")
+		return
+	}
+
+	session.wssConnectionsMu.RLock()
+	length := len(session.wssConnections)
+	session.wssConnectionsMu.RUnlock()
+	if length >= 8 {
+		log.Print("reached maximum number of wss connections per session")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprintln(w, "At or exceeded maximum number of streams per session")
+		return
+	}
+
+	conn, err := server.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Print("error: failed to upgrade connection: ", err)
 		return
 	}
 
@@ -440,4 +534,23 @@ func (server *Server) HandleWebsocketRequest(w http.ResponseWriter, r *http.Requ
 	session.wssConnectionsMu.Unlock()
 
 	go session.HandleWebsocketLoop(connectionObject)
+}
+
+func (server *Server) HandleKeysEndpoint(w http.ResponseWriter, r *http.Request) {
+	verifierPublicBase64 := base64.StdEncoding.EncodeToString(*server.verifier.publicKey)
+	identityProviderPublicBase64 := base64.StdEncoding.EncodeToString(server.identityProvider.publicKey)
+	res := KeysEndpointResponse{Ok: true, Keys: &KeysField{Challenge: &verifierPublicBase64, Identity: &identityProviderPublicBase64}}
+	jsonBytes, err := json.Marshal(res)
+	if err != nil {
+		log.Print("failed to marshal into json: ", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintln(w, "{\"ok\":false}")
+		return
+	} else {
+		jsonString := string(jsonBytes)
+		log.Print("returning keys")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintln(w, jsonString)
+		return
+	}
 }

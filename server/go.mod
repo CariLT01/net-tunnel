@@ -1,10 +1,15 @@
 module github.com/CariLT01/lt-vpn2-server
 
-go 1.24.5
+go 1.25.0
 
 require (
 	github.com/cloudflare/circl v1.6.3
+	github.com/golang-jwt/jwt v3.2.2+incompatible
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/gorilla/websocket v1.5.3
 )
 
-require golang.org/x/sys v0.28.0 // indirect
+require (
+	golang.org/x/sys v0.28.0 // indirect
+	golang.org/x/time v0.15.0 // indirect
+)

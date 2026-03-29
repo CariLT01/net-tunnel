@@ -31,7 +31,11 @@ type ConnectionHandler struct {
 	clientConnectionIDs        map[int]struct{}
 	clientConnectionIDsRWMutex sync.RWMutex
 
-	sessionId int
+	sessionId     int
+	powSolver     *ProofOfWorkSolver
+	identityToken string
+
+	keys *Keys
 }
 
 type ProxyClient struct {
@@ -47,6 +51,8 @@ func NewConnectionHandler() *ConnectionHandler {
 		clientConnectionIDs:        make(map[int]struct{}),
 		clientConnectionIDsRWMutex: sync.RWMutex{},
 
-		sessionId: -1,
+		sessionId:     -1,
+		powSolver:     &ProofOfWorkSolver{},
+		identityToken: "",
 	}
 }

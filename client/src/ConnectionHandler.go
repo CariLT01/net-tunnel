@@ -19,18 +19,23 @@ import (
 )
 
 type SessionCreationResponse struct {
-	Ok   bool `json:"ok"`
-	Data *int `json:"data"`
+	Ok            bool    `json:"ok"`
+	SessionId     *int    `json:"sessionId"`
+	IdentityToken *string `json:"identityToken"`
 }
 
 func (app *ConnectionHandler) connectToWebsocket() *ProxyWebsocketConnection {
-	u := url.URL{Scheme: "ws", Host: RELAY_URL, Path: "/stream"}
+	u := url.URL{Scheme: SCHEME_WS, Host: RELAY_URL, Path: "/stream"}
 	q := u.Query()
 	q.Set("sessionId", strconv.Itoa(app.sessionId))
+
+	headers := http.Header{}
+	headers.Set("Authorization", "Bearer "+app.identityToken)
+
 	u.RawQuery = q.Encode()
-	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	c, _, err := websocket.DefaultDialer.Dial(u.String(), headers)
 	if err != nil {
-		log.Fatal("Failed to dial")
+		log.Fatal("Failed to dial: ", err)
 	}
 
 	connectionObj := &ProxyWebsocketConnection{
@@ -165,8 +170,22 @@ func (app *ConnectionHandler) CreateWebSocket() {
 }
 
 func (app *ConnectionHandler) CreateSession() {
-	u := url.URL{Scheme: "http", Host: RELAY_URL, Path: "/session/create"}
+
+	// solve pow
+
+	sessionManager := SessionManager{}
+	app.keys = sessionManager.FetchPublicKey()
+	challengeToken, nonce := app.powSolver.GetChallengeAndSolve(app.keys)
+	log.Print("challenge: ", challengeToken, " solution: ", nonce)
+	log.Print("TEST 1")
+
+	u := url.URL{Scheme: SCHEME_HTTP, Host: RELAY_URL, Path: "/session/create"}
+	q := u.Query()
+	q.Set("challengeToken", challengeToken)
+	q.Set("solution", strconv.FormatInt(nonce, 10))
+	u.RawQuery = q.Encode()
 	resp, err := http.Get(u.String())
+	log.Print("TEST 3")
 	if err != nil {
 		log.Fatal("Failed to create session: ", err)
 	}
@@ -175,19 +194,34 @@ func (app *ConnectionHandler) CreateSession() {
 	if err != nil {
 		log.Fatal("failed to read body: ", err)
 	}
+	log.Print("TEST 2")
+
+	log.Print("body: " + string(body))
 
 	var r SessionCreationResponse
 	json.Unmarshal(body, &r)
 
+	log.Print(r)
+
 	if r.Ok == false {
 		log.Fatal("failed to create session: server returned ok=false")
 	}
-	if r.Data == nil {
+	if r.SessionId == nil {
 		log.Fatal("failed to create session. server returned ok=true but data=nil")
 	}
+	if r.IdentityToken == nil {
+		log.Fatal("no identity token returned")
+	}
 
-	app.sessionId = *r.Data
+	identityToken := *r.IdentityToken
 
+	if !VerifyIdentityToken(identityToken, *r.SessionId, app.keys.identityKey) {
+		log.Fatal("identity token is not valid")
+	}
+
+	app.sessionId = *r.SessionId
+	app.identityToken = *r.IdentityToken
+	log.Print("identity token: ", app.identityToken)
 	log.Print("created session id: ", app.sessionId)
 }
 
@@ -195,7 +229,7 @@ func (app *ConnectionHandler) Initialize() {
 
 	app.CreateSession()
 
-	for i := 0; i < NUMBER_OF_CONNECTIONS; i++ {
+	for i := 0; i < 2; i++ {
 		app.CreateWebSocket()
 		log.Print("Connection #", i, " created")
 	}
@@ -367,6 +401,7 @@ func (app *ConnectionHandler) HandleNewConnection(conn net.Conn) {
 	app.localConnectionsMutex.Unlock()
 
 	log.Print("reserved client id: ", clientId)
+	app.clientConnectionIDsRWMutex.Lock()
 
 	buf := make([]byte, 32*1024)
 	for {

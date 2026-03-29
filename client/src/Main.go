@@ -5,9 +5,22 @@ import (
 	"log"
 	"net"
 	"time"
+
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/widget"
 )
 
+func fyneApp() {
+	myApp := app.New()
+	myWindow := myApp.NewWindow("Hello Fyne")
+
+	myWindow.SetContent(widget.NewLabel("Hello, World!"))
+	myWindow.ShowAndRun()
+}
+
 func main() {
+
+	go fyneApp()
 
 	fmt.Println("--- Lightweight encrypted tunnel ---")
 	fmt.Println("info:")
@@ -20,7 +33,7 @@ func main() {
 	fmt.Println(" - limit: 256 concurrent tcp streams")
 
 	fmt.Println("\n\n\nLoading...")
-	time.Sleep(5 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	connectionHandler := NewConnectionHandler()
 

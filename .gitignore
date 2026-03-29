@@ -3,5 +3,5 @@
 
 # Ignore public/private keypair
 
-/server/src/Key.go
 /client/src/Key.go
+/KEYS.txt

@@ -13,6 +13,12 @@ type ProxyLocalConnection struct {
 	wssConnectionIndex int
 	destination        string
 	wssConnectionid    int
+
+	// Reordering
+	sequenceId         atomic.Int64
+	expectedSequenceId atomic.Int64
+	queuedPackets      map[int64][]byte
+	queuedPacketsMu    sync.RWMutex
 }
 
 type ProxyWebsocketConnection struct {
@@ -39,8 +45,12 @@ type ConnectionHandler struct {
 	powSolver     *ProofOfWorkSolver
 	identityToken string
 
-	keys   *Keys
-	config *ConfigurationManager
+	keys              *Keys
+	config            *ConfigurationManager
+	roundRobinCounter atomic.Int64
+
+	activeConnectionIndexes   []int
+	activeConnectionIndexesMu sync.RWMutex
 }
 
 type ProxyClient struct {
@@ -60,5 +70,8 @@ func NewConnectionHandler() *ConnectionHandler {
 		powSolver:     &ProofOfWorkSolver{},
 		identityToken: "",
 		config:        NewConfigManager(),
+
+		activeConnectionIndexes:   make([]int, 0),
+		activeConnectionIndexesMu: sync.RWMutex{},
 	}
 }

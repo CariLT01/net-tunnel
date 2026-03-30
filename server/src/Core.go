@@ -10,16 +10,26 @@ import (
 	"golang.org/x/time/rate"
 )
 
+var RATE_LIMIT_MBPS = 200_000_000
+var RATE_LIMIT_BURST_MBPS = 500_000_000
+
 type WebsocketConnection struct {
 	connection   *websocket.Conn
 	writeMutex   sync.Mutex
 	sharedSecret []byte
 
 	handshakeTranscript []byte
+	ready               bool
 }
 
 type TCPConnection struct {
 	conn *net.Conn
+
+	ExpectedSequenceID atomic.Int64
+	QueuedPackets      map[int64][]byte
+	QueuedPacketsMu    sync.RWMutex
+
+	SendSequenceId atomic.Int64
 }
 
 type Session struct {
@@ -30,7 +40,8 @@ type Session struct {
 	lastActiveTime   time.Time
 	clientsActive    atomic.Int32
 
-	outboundLimiter *rate.Limiter
+	outboundLimiter    *rate.Limiter
+	roundRobinIterator atomic.Int64
 }
 
 type Server struct {
@@ -50,7 +61,7 @@ func NewSession() *Session {
 		clientsActive:    atomic.Int32{},
 		wssConnections:   make([]*WebsocketConnection, 0),
 		wssConnectionsMu: sync.RWMutex{},
-		outboundLimiter:  rate.NewLimiter(rate.Limit(20_000_000/8), 50_000_000/8),
+		outboundLimiter:  rate.NewLimiter(rate.Limit(RATE_LIMIT_MBPS/8), RATE_LIMIT_BURST_MBPS/8),
 	}
 }
 

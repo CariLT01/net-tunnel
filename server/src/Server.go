@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -20,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cloudflare/circl/kem/kyber/kyber768"
@@ -110,6 +112,77 @@ func GetDialTarget(msg []byte) (string, string, error) {
 	}
 
 	return "", "", fmt.Errorf("could not determine target host")
+}
+
+func (session *Session) EncryptPayload(wsConn *WebsocketConnection, message []byte) ([]byte, error) {
+	ct, err := Encrypt(wsConn.sharedSecret, message)
+	if err != nil {
+		log.Print("failed to encrypt: ", err)
+		return nil, err
+	}
+	return ct, nil
+}
+
+func (session *Session) countActiveWebsocketConnections() []int {
+	indexes := make([]int, 0)
+	for index, conn := range session.wssConnections {
+		if conn.ready {
+			indexes = append(indexes, index)
+		}
+	}
+	return indexes
+}
+
+func (session *Session) SendWebsocketRoundRobinEncrypt(clientId byte, payload []byte) {
+
+	session.wssConnectionsMu.RLock()
+	defer session.wssConnectionsMu.RUnlock()
+
+	firstTry := -1
+
+	for {
+
+		activeConnectionIndexes := session.countActiveWebsocketConnections()
+
+		if len(activeConnectionIndexes) == 0 {
+			log.Print("cannot divide by 0")
+			return
+		}
+		currentIndexFake := int(session.roundRobinIterator.Load() % int64(len(activeConnectionIndexes)))
+		currentIndex := activeConnectionIndexes[currentIndexFake]
+		session.roundRobinIterator.Add(1)
+
+		targetWs := session.wssConnections[currentIndex]
+
+		ciphertext, err := Encrypt(targetWs.sharedSecret, payload)
+		if err != nil {
+			log.Print("error: failed to encrypt: ", err)
+			continue
+		}
+
+		forwardData := append([]byte{0, byte(clientId)}, ciphertext...)
+
+		targetWs.writeMutex.Lock()
+		err = targetWs.connection.WriteMessage(websocket.BinaryMessage, forwardData)
+		targetWs.writeMutex.Unlock()
+
+		if err != nil {
+			log.Print("Failed to write, trying again")
+			if firstTry == -1 {
+				log.Print("first try: ", currentIndex)
+				firstTry = currentIndex
+			} else {
+				if currentIndex == firstTry {
+					log.Print("not retrying again, looped back and still cannot write")
+					return
+				}
+			}
+		} else {
+			// log.Print("Message originally sent to client: ", payload)
+			return
+		}
+	}
+
 }
 
 func (session *Session) SendAndReassign(wsConn *WebsocketConnection, clientId int, message []byte) *WebsocketConnection {
@@ -204,7 +277,12 @@ func (session *Session) HandleTCPConnection(conn *TCPConnection, wsConn *Websock
 		}
 		// log.Print("received ", n, " bytes from TCP socket")
 
-		data := buf[:n]
+		sequenceId := conn.SendSequenceId.Load()
+		conn.SendSequenceId.Add(1)
+		sequenceIdBytes := make([]byte, 4)
+		binary.BigEndian.PutUint32(sequenceIdBytes, uint32(sequenceId))
+
+		data := append(sequenceIdBytes, buf[:n]...)
 		// forward directly, but append data first
 
 		// reassign automatically
@@ -212,12 +290,9 @@ func (session *Session) HandleTCPConnection(conn *TCPConnection, wsConn *Websock
 		// first wait
 		session.limiterWait(session.outboundLimiter, len(data))
 
-		newConn := session.SendAndReassign(wsConn, clientId, data)
-		if newConn == nil {
-			log.Print("error: unable to write: nothing to reassign to, disconnecting")
-			return
-		}
-		wsConn = newConn
+		// log.Printf("Sent message sum: %x\n", sha256.Sum256(buf[:n]))
+		// log.Print("Message sent: ", base64.StdEncoding.EncodeToString(buf[:n]))
+		session.SendWebsocketRoundRobinEncrypt(byte(clientId), data)
 
 	}
 }
@@ -242,6 +317,65 @@ func (session *Session) limiterWait(limiter *rate.Limiter, n int) error {
 	return nil
 }
 
+func (connection *TCPConnection) QueueAndSend(message []byte) error {
+	// first 4 bytes contain sequenceID
+	if len(message) < 5 {
+		return fmt.Errorf("Unable to queue and send: message is too short to contain valid framing!")
+	}
+
+	messageSquenceId := binary.BigEndian.Uint32(message[:4])
+	messagePayload := message[4:]
+
+	// log.Print("Writing message payload: ", len(messagePayload), " bytes, sequence ID: ", messageSquenceId)
+
+	if messageSquenceId-uint32(connection.ExpectedSequenceID.Load()) > 500 {
+		return fmt.Errorf("Message sequence ID deviates too far from expected sequence ID! (>500)")
+	}
+
+	tcpConnection := *connection.conn
+
+	// Reordering logic -- reorders packets for correct order
+
+	connection.QueuedPacketsMu.Lock()
+	// Add it to the queue
+	connection.QueuedPackets[int64(messageSquenceId)] = messagePayload
+
+	for {
+		// check if sequence ID now exists
+		expectedSequenceIdCurrent := connection.ExpectedSequenceID.Load()
+		currentMessage, exists := connection.QueuedPackets[expectedSequenceIdCurrent]
+		if !exists {
+			// log.Print("Sequence ID: ", expectedSequenceIdCurrent, " does not exist. Breaking out of the loop\nNumber of packets to be reordered: ", len(connection.QueuedPackets))
+			break
+		}
+
+		// Deliver the payload
+		// log.Print("Sent sequence ID: ", expectedSequenceIdCurrent, " to destination")
+		tcpConnection.Write(currentMessage)
+
+		// Remove from the list
+		delete(connection.QueuedPackets, expectedSequenceIdCurrent)
+
+		// Increment sequence ID
+		connection.ExpectedSequenceID.Add(1)
+
+		// log.Print("Message originally received (and sent to TCP): ", base64.StdEncoding.EncodeToString(currentMessage))
+		// log.Printf("Received message sha256: %x\n", sha256.Sum256(currentMessage))
+	}
+	connection.QueuedPacketsMu.Unlock()
+
+	return nil
+}
+
+func (conn *WebsocketConnection) GetSendPayloadFromTCP(clientId int, sequenceId int64, message []byte) []byte {
+	sequenceIdBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(sequenceIdBytes, uint32(sequenceId))
+
+	finalPayload := append(append([]byte{byte(clientId)}, sequenceIdBytes...), message...)
+
+	return finalPayload
+}
+
 func (session *Session) HandleWebsocketLoop(conn *WebsocketConnection) {
 
 	log.Print("detected new websocket")
@@ -250,6 +384,9 @@ func (session *Session) HandleWebsocketLoop(conn *WebsocketConnection) {
 	defer conn.connection.Close()
 	defer session.clientsActive.Add(-1)
 	defer session.DeleteWebsocketConn(conn)
+	defer func() {
+		conn.ready = false
+	}()
 
 	scheme := kyber768.Scheme()
 
@@ -300,8 +437,12 @@ func (session *Session) HandleWebsocketLoop(conn *WebsocketConnection) {
 			messagePayload := plaintext
 			if !exists {
 				log.Print("unknown client id ", clientID, " attempting to dial")
+				if len(messagePayload) < 5 {
+					log.Print("message too short")
+					continue
+				}
 
-				host, method, hostError := GetDialTarget(messagePayload)
+				host, method, hostError := GetDialTarget(messagePayload[4:])
 				if hostError != nil {
 					log.Print("error: unable to resolve dial destination: ", hostError)
 				}
@@ -315,12 +456,18 @@ func (session *Session) HandleWebsocketLoop(conn *WebsocketConnection) {
 				log.Print("connection dialed successfully")
 
 				tcpConnObj := &TCPConnection{
-					conn: &tcpConn,
+					conn:               &tcpConn,
+					ExpectedSequenceID: atomic.Int64{},
+					QueuedPackets:      make(map[int64][]byte),
+					QueuedPacketsMu:    sync.RWMutex{},
+					SendSequenceId:     atomic.Int64{},
 				}
 
 				go session.HandleTCPConnection(tcpConnObj, conn, int(clientID))
 				//log.Print("writing ", messagePayload)
 				//tcpConn.Write(messagePayload)
+
+				tcpConnObj.ExpectedSequenceID.Add(1) // initial client packet, so add 1
 
 				if isConnect {
 					msgEstablished := []byte("HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -330,14 +477,26 @@ func (session *Session) HandleWebsocketLoop(conn *WebsocketConnection) {
 					// ensure that the pending handshake data still goes somewhere
 					// even if a websocket disconnects in the middle of all this logic
 
-					newConn := session.SendAndReassign(conn, int(clientID), msgEstablished)
-					if newConn == nil {
-						log.Print("error: cannot send: no reassign")
-						return
-					}
-					conn = newConn
+					// send it back
+
+					// add seq id
+					sequenceId := tcpConnObj.SendSequenceId.Load()
+					tcpConnObj.SendSequenceId.Add(1)
+					sequenceIdBytes := make([]byte, 4)
+					binary.BigEndian.PutUint32(sequenceIdBytes, uint32(sequenceId))
+
+					data := append(sequenceIdBytes, msgEstablished...)
+
+					// log.Print("Send Websocket round robin and encrypting (initial established): ", base64.StdEncoding.EncodeToString(msgEstablished))
+					// log.Printf("Sent message sum: %x\n", sha256.Sum256(msgEstablished))
+					session.SendWebsocketRoundRobinEncrypt(clientID, data)
 				} else {
-					tcpConn.Write(messagePayload)
+					err := tcpConnObj.QueueAndSend(messagePayload[4:])
+					if err != nil {
+						log.Print("error: failed to forward original handshake: ", err)
+					} else {
+						log.Print("Forwarded handshake to TCP connection")
+					}
 				}
 
 				session.clientIDsMu.Lock()
@@ -348,7 +507,11 @@ func (session *Session) HandleWebsocketLoop(conn *WebsocketConnection) {
 
 				// rate limiting
 				session.limiterWait(session.outboundLimiter, len(messagePayload))
-				(*(tcpConn.conn)).Write(messagePayload)
+				err := tcpConn.QueueAndSend(messagePayload)
+				if err != nil {
+					log.Print("error: failed to forward: ", err)
+					continue
+				}
 			}
 		} else if message[0] == 3 {
 
@@ -374,6 +537,7 @@ func (session *Session) HandleWebsocketLoop(conn *WebsocketConnection) {
 
 			conn.connection.WriteMessage(websocket.BinaryMessage, append([]byte{1}, transcriptSignature...))
 			ready = true
+			conn.ready = true
 			log.Print("encryption handshake complete")
 			log.Print("shared secret length: ", len(sharedSecret))
 			log.Print("transcript signature: ", transcriptSignature)

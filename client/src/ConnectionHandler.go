@@ -4,6 +4,7 @@ import (
 	"crypto/hkdf"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -88,6 +89,56 @@ func (app *ConnectionHandler) DeleteWebsocket(conn *ProxyWebsocketConnection) {
 	app.wssConnections = slices.Delete(app.wssConnections, index, index+1)
 }
 
+func (connection *ProxyLocalConnection) QueueAndSend(message []byte) error {
+	// first 4 bytes contain sequenceID
+	if len(message) < 5 {
+		return fmt.Errorf("Unable to queue and send: message is too short to contain valid framing!")
+	}
+
+	messageSquenceId := binary.BigEndian.Uint32(message[:4])
+	messagePayload := message[4:]
+
+	// log.Print("Writing message payload: ", len(messagePayload), " bytes, sequence ID: ", messageSquenceId)
+
+	if messageSquenceId-uint32(connection.expectedSequenceId.Load()) > 500 {
+		return fmt.Errorf("Message sequence ID deviates too far from expected sequence ID! (>500)")
+	}
+
+	tcpConnection := connection.localConnection
+
+	// Reordering logic -- reorders packets for correct order
+
+	connection.queuedPacketsMu.Lock()
+	// Add it to the queue
+	connection.queuedPackets[int64(messageSquenceId)] = messagePayload
+
+	for {
+		// check if sequence ID now exists
+		expectedSequenceIdCurrent := connection.expectedSequenceId.Load()
+		currentMessage, exists := connection.queuedPackets[expectedSequenceIdCurrent]
+		if !exists {
+			// log.Print("Sequence ID: ", expectedSequenceIdCurrent, " does not exist. Breaking out of the loop\nNumber of packets to be reordered: ", len(connection.queuedPackets))
+			break
+		}
+
+		// Deliver the payload
+		// log.Print("Sent sequence ID: ", expectedSequenceIdCurrent, " to destination")
+		tcpConnection.Write(currentMessage)
+
+		// Remove from the list
+		delete(connection.queuedPackets, expectedSequenceIdCurrent)
+
+		// Increment sequence ID
+		connection.expectedSequenceId.Add(1)
+
+		// log.Print("Message originally received and sent to TCP: ", base64.StdEncoding.EncodeToString(currentMessage))
+		// log.Printf("Originally received sum: %x\n", sha256.Sum256(currentMessage))
+	}
+	connection.queuedPacketsMu.Unlock()
+
+	return nil
+}
+
 func (app *ConnectionHandler) HandleWebsocketRead(conn *ProxyWebsocketConnection) {
 	defer conn.connection.Close()
 	defer app.onSocketDied(conn)
@@ -120,6 +171,16 @@ func (app *ConnectionHandler) HandleWebsocketRead(conn *ProxyWebsocketConnection
 		if err != nil {
 			log.Print("Proxy Websocket Disconnected")
 			conn.ready.Store(false)
+			// get index
+			app.wssConnectionsMutex.RLock()
+			index := slices.Index(app.wssConnections, conn)
+			app.wssConnectionsMutex.RUnlock()
+			if index != -1 {
+				app.activeConnectionIndexesMu.Lock()
+				i := slices.Index(app.activeConnectionIndexes, index)
+				app.activeConnectionIndexes = append(app.activeConnectionIndexes[:i], app.activeConnectionIndexes[i+1:]...)
+				app.activeConnectionIndexesMu.Unlock()
+			}
 			break
 		}
 
@@ -148,7 +209,11 @@ func (app *ConnectionHandler) HandleWebsocketRead(conn *ProxyWebsocketConnection
 				continue
 			}
 
-			localConnection.localConnection.Write(plaintext)
+			err = localConnection.QueueAndSend(plaintext)
+			if err != nil {
+				log.Print("error: failed to forward packet: ", err)
+				continue
+			}
 		} else if message[0] == 1 { // means client ready
 
 			if !(completion.KyberHandshakeReceived) {
@@ -298,6 +363,16 @@ func (app *ConnectionHandler) HandleWebsocketRead(conn *ProxyWebsocketConnection
 				}
 
 				conn.ready.Store(true)
+				// find out index
+				app.wssConnectionsMutex.RLock()
+				index := slices.Index(app.wssConnections, conn)
+				app.wssConnectionsMutex.RUnlock()
+				if index != -1 {
+					app.activeConnectionIndexesMu.Lock()
+					app.activeConnectionIndexes = append(app.activeConnectionIndexes, index)
+					app.activeConnectionIndexesMu.Unlock()
+				}
+
 				log.Print("connection is ready")
 				conn.handshakeSucceeded.Store(true)
 				log.Print("marked handshake succeeded")
@@ -521,6 +596,60 @@ func (app *ConnectionHandler) MultiplexingScalingLoop() {
 	}
 }
 
+func (app *ConnectionHandler) GetActiveConnections() []int {
+	return app.activeConnectionIndexes
+}
+
+func (app *ConnectionHandler) SendWebsocketRoundRobinEncrypt(clientId byte, message []byte) {
+
+	app.wssConnectionsMutex.RLock()
+	defer app.wssConnectionsMutex.RUnlock()
+
+	firstIndexTried := -1
+
+	for {
+		activeConnections := app.GetActiveConnections()
+		if len(activeConnections) <= 0 {
+			log.Print("cannot divide by 0")
+			return
+		}
+		currentIndexPointer := int(app.roundRobinCounter.Load() % int64(len(activeConnections)))
+		app.roundRobinCounter.Add(1)
+		currentIndex := activeConnections[currentIndexPointer]
+
+		targetSocket := app.wssConnections[currentIndex]
+
+		//data := append(sequenceIdBuf, buf[:n]...)
+		// forward directly, but append data first
+		ciphertext, err := Encrypt(targetSocket.sharedSecret, message)
+		if err != nil {
+			log.Print("error: failed to encrypt: ", err)
+			continue
+		}
+
+		forwardData := append([]byte{0, byte(clientId)}, ciphertext...)
+
+		targetSocket.writeMutex.Lock()
+		err = targetSocket.connection.WriteMessage(websocket.BinaryMessage, forwardData)
+		targetSocket.writeMutex.Unlock()
+		if err != nil {
+			log.Print("failed to send, retrying")
+			if firstIndexTried == -1 {
+				firstIndexTried = currentIndex
+			} else {
+				if firstIndexTried == currentIndex {
+					log.Print("looped back to first, all websockets failed to send")
+					return
+				}
+			}
+		} else {
+			// log.Print("Message originally sent to server: ", message)
+			return
+		}
+	}
+
+}
+
 func (app *ConnectionHandler) HandleNewConnection(conn net.Conn) {
 
 	log.Print("new tcp connection")
@@ -559,6 +688,10 @@ func (app *ConnectionHandler) HandleNewConnection(conn net.Conn) {
 		wssConnectionIndex: leastWebsocketCountIndex,
 		destination:        "",
 		wssConnectionid:    clientId,
+		queuedPackets:      make(map[int64][]byte),
+		queuedPacketsMu:    sync.RWMutex{},
+		sequenceId:         atomic.Int64{},
+		expectedSequenceId: atomic.Int64{},
 	}
 	app.localConnections[clientId] = localConnection
 	app.localConnectionsMutex.Unlock()
@@ -586,64 +719,23 @@ func (app *ConnectionHandler) HandleNewConnection(conn net.Conn) {
 			return
 		}
 
-		data := buf[:n]
-		// forward directly, but append data first
-		ciphertext, err := Encrypt(wsSocket.sharedSecret, data)
-		if err != nil {
-			log.Print("error: failed to encrypt: ", err)
-			continue
-		}
-		forwardData := append([]byte{0, byte(clientId)}, ciphertext...)
+		// sequence id
+		currentSequenceId := localConnection.sequenceId.Load()
+		localConnection.sequenceId.Add(1)
+		sequenceIdBuf := make([]byte, 4)
+		binary.BigEndian.PutUint32(sequenceIdBuf, uint32(currentSequenceId))
+		// data
+		data := append(sequenceIdBuf, buf[:n]...)
 
 		// log.Print("received ", n, " bytes from TCP")
 
 		// write
 
-		err = app.SocketWriteMessage(wsSocket, forwardData)
-		if err != nil {
-			log.Print("error: unable to write data, reassigning")
-			attempts := 0
-			oldStream := wsSocket
-			for {
-				if attempts >= 256 {
-					log.Print("error: unable to reassign: too many attempts")
-					return
-				}
+		//
+		// log.Printf("sent message sum sha256: %x\n", sha256.Sum256(buf[:n]))
+		// log.Print("Message sent to server: ", base64.StdEncoding.EncodeToString(buf[:n]))
 
-				leastWebsocketCountIndex = app.AssignConnectionHandler()
-				if leastWebsocketCountIndex == -1 {
-					log.Print("error: nothing to reassign to, disconnecting")
-					return
-				}
-
-				app.wssConnectionsMutex.RLock()
-				wsSocket = app.wssConnections[leastWebsocketCountIndex]
-				app.wssConnectionsMutex.RUnlock()
-
-				localConnection.wssConnectionIndex = leastWebsocketCountIndex
-
-				// reencrypt
-				ciphertext, err := Encrypt(wsSocket.sharedSecret, data)
-				if err != nil {
-					log.Print("error: failed to encrypt: ", err)
-					continue
-				}
-				forwardData := append([]byte{0, byte(clientId)}, ciphertext...)
-
-				// resend!
-				err = app.SocketWriteMessage(wsSocket, forwardData)
-				if err != nil {
-					log.Print("error: new reassigned socket still cannot be written to: ", err, " retrying")
-					attempts++
-				} else {
-					log.Print("reassigned to stream ", leastWebsocketCountIndex, " after ", attempts, " attempts")
-					oldStream.connectedCount.Add(-1)
-					wsSocket.connectedCount.Add(1)
-					break
-				}
-			}
-
-		}
+		app.SendWebsocketRoundRobinEncrypt(byte(clientId), data)
 
 	}
 }

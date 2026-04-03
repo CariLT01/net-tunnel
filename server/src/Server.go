@@ -8,7 +8,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -17,16 +16,13 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"slices"
 	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	shared "github.com/CariLT01/net-tunnel-common/shared"
 	"github.com/cloudflare/circl/kem/kyber/kyber768"
-	"github.com/gorilla/websocket"
+
 	"golang.org/x/time/rate"
 )
 
@@ -44,13 +40,7 @@ type HandshakeProtocolCompletion struct {
 	KeyConfirmed          bool
 }
 
-func (session *Session) WebsocketWriteMessage(conn *WebsocketConnection, message []byte) error {
-	conn.writeMutex.Lock()
-	err := conn.connection.WriteMessage(websocket.BinaryMessage, message)
-	conn.writeMutex.Unlock()
-	session.lastActiveTime = time.Now()
-	return err
-}
+
 
 func GetDialTarget(msg []byte) (string, string, error) {
 	// Split headers from the first line
@@ -138,22 +128,19 @@ func (session *Session) HandleTCPConnection(conn *shared.TCPStream, wsConn *shar
 			log.Print("detected tcp socket closed. error: ", err)
 			if clientId != -1 {
 				log.Print("writing disconnect to server")
-				writeErr := session.WebsocketWriteMessage(wsConn, []byte{2, byte(clientId)})
-				if writeErr != nil {
-					log.Print("error: unable to write disconnect: ", writeErr)
-				}
+				session.multiplexer.SendSignal(shared.MessageTypeStreamDisconnect, []byte{byte(clientId)})
 			}
 			return
 		}
 		// log.Print("received ", n, " bytes from TCP socket")
 
-		tcpSendPayload := conn.EncodePacketPayload(buf[:n])
+		tcpSendPayload := conn.EncodePacketPayload(byte(clientId), buf[:n])
 		// first wait
 		session.limiterWait(session.outboundLimiter, len(tcpSendPayload))
 
 		// log.Printf("Sent message sum: %x\n", sha256.Sum256(buf[:n]))
 		// log.Print("Message sent: ", base64.StdEncoding.EncodeToString(buf[:n]))
-		session.multiplexer.SendData(shared.MessageTypeNetwork, append([]byte{byte(clientId)}, tcpSendPayload...))
+		session.multiplexer.SendData(shared.MessageTypeNetwork, tcpSendPayload)
 
 	}
 }
@@ -178,7 +165,7 @@ func (session *Session) ProcessSignalPacket(signalpacket *shared.SignalDecodedPa
 			session.multiplexer.HandshakeTranscript = append(session.multiplexer.HandshakeTranscript, signalpacket.Payload...)
 			//conn.AppendToTranscript(signalpacket.Payload)
 			ciphertext := signalpacket.Payload
-			sharedSecret, err := session.multiplexer.Scheme.Decapsulate(privateKey, ciphertext)
+			sharedSecret, err := session.multiplexer.Scheme.Decapsulate(session.multiplexer.PrivateKey, ciphertext)
 			if err != nil {
 				log.Print("error: handshake failed: decapsulate failed: ", err)
 				return shared.PacketProcessingDisconnect
@@ -223,7 +210,7 @@ func (session *Session) ProcessSignalPacket(signalpacket *shared.SignalDecodedPa
 			log.Print("received client hello nonce")
 			session.multiplexer.HandshakeTranscript = append(session.multiplexer.HandshakeTranscript, signalpacket.Payload...)
 
-			publicKeyBin, err := publicKey.MarshalBinary()
+			publicKeyBin, err := session.multiplexer.PublicKey.MarshalBinary()
 			if err != nil {
 				log.Print("error: unable to pack public key", err)
 				return shared.PacketProcessingDisconnect
@@ -234,7 +221,7 @@ func (session *Session) ProcessSignalPacket(signalpacket *shared.SignalDecodedPa
 			
 			payload := publicKeyBin
 
-			session.multiplexer.HandshakeTranscript = append(session.multiplexer.HandshakeTranscript, payload)
+			session.multiplexer.HandshakeTranscript = append(session.multiplexer.HandshakeTranscript, payload...)
 			session.multiplexer.SendSignal(shared.MessageTypeHandshake, payload)
 
 			session.multiplexer.ProtocolCompletion.ClientHelloReceived = true
@@ -353,6 +340,8 @@ func (session *Session) HandleWebsocketLoop(conn *shared.WSStream) {
 		conn.SetReady(false)
 	}()
 	publicKey, privateKey, err := kyber768.GenerateKeyPair(rand.Reader)
+	session.multiplexer.PublicKey = publicKey
+	session.multiplexer.PrivateKey = privateKey
 	if err != nil {
 		log.Print("error: failed to generate keypair", err)
 		return

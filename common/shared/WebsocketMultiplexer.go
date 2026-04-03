@@ -58,12 +58,18 @@ type WebsocketMultiplexer struct {
 	/* GLOBAL HANDSHAKE STATE */
 	Ready atomic.Bool
 	ProtocolCompletion *HandshakeProtocolCompletion
-	SharedSecret []byte
 	HandshakeTranscript []byte
 
 	Scheme kem.Scheme
 
 	SessionEnded atomic.Bool
+
+	/* don't want the school to see what you're doing */
+	SharedSecret []byte
+	PublicKey *kyber768.PublicKey
+	PrivateKey *kyber768.PrivateKey
+	
+
 }
 
 /* 
@@ -181,43 +187,7 @@ func (multiplexer *WebsocketMultiplexer) SendData(messageType MessageType, data 
 	multiplexer.SendDataRawOnAny(encodedPacket)
 }
 
-func (multiplexer *WebsocketMultiplexer) ProcessSignalPacket(pckt *PreprocessedPacket, processPacketOnceDone func(*PreprocessedPacket)) {
-	// get seq id
-	seqId := pckt.Payload[:4]
-	seqIdInt := binary.BigEndian.Uint32(seqId)
 
-	if seqIdInt-multiplexer.SignalExpectedSeqId.Load() > 500 {
-		log.Print("error: packet arrived too early >500")
-		return
-	}
-
-	if seqIdInt < multiplexer.SignalExpectedSeqId.Load() {
-		log.Print("error: same packet processed before")
-		return
-	}
-
-	multiplexer.SignalUnorderedMu.Lock()
-	defer multiplexer.SignalUnorderedMu.Unlock()
-	multiplexer.SignalUnordered[seqIdInt] = pckt
-
-	for {
-		currentSeqId := multiplexer.SignalExpectedSeqId.Load()
-		currentPacket, exists := multiplexer.SignalUnordered[currentSeqId]
-		if !exists {
-			log.Print("reached end of reorder stack")
-			return
-		}
-
-		multiplexer.SignalExpectedSeqId.Add(1)
-
-		// process packet
-		processPacketOnceDone(currentPacket)
-		// remove packet
-		delete(multiplexer.SignalUnordered, currentSeqId)
-
-	}
-
-}
 
 func (multiplexer *WebsocketMultiplexer) PacketPreprocess(rawDecryptedData []byte) *PreprocessedPacket {
 	messageType := rawDecryptedData[0]

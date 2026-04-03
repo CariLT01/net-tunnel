@@ -30,12 +30,6 @@ type SessionCreationResponse struct {
 	IdentityToken *string `json:"identityToken"`
 }
 
-type HandshakeProtocolCompletion struct {
-	KyberHandshakeReceived  bool
-	SignatureReceived       bool
-	KeyConfirmationReceived bool
-}
-
 func (app *ConnectionHandler) connectToWebsocket() (*ProxyWebsocketConnection, error) {
 	u := url.URL{Scheme: app.config.config.WebsocketScheme, Host: app.config.config.VpnServer, Path: "/stream"}
 	q := u.Query()
@@ -139,6 +133,270 @@ func (connection *ProxyLocalConnection) QueueAndSend(message []byte) error {
 	return nil
 }
 
+func (app *ConnectionHandler) SendAnyWebsocket(payload []byte) {
+	// if there are any active
+	app.activeConnectionIndexesMu.RLock()
+	defer app.activeConnectionIndexesMu.RUnlock()
+
+	attempts := 0
+
+	for {
+
+		if attempts >= 50 {
+			log.Print("error: failed to send to any websocket. failed after 50 attempts")
+			return
+		}
+
+		activeConnections := app.activeConnectionIndexes
+
+		if len(activeConnections) <= 0 {
+			log.Print("error: cannot send, no active connections. queuing for retransmit")
+			app.toBeRetransmittedPackets = append(app.toBeRetransmittedPackets, payload)
+			return
+		}
+
+		// take any connection
+		curretCounter := app.roundRobinCounter.Load()
+		app.roundRobinCounter.Add(1)
+		targetConnectionIndex := app.activeConnectionIndexes[curretCounter%int64(len(app.activeConnectionIndexes))]
+
+		app.wssConnectionsMutex.Lock()
+		targetConnection := app.wssConnections[targetConnectionIndex]
+		app.wssConnectionsMutex.Unlock()
+
+		// send it onto that connection
+		err := targetConnection.connection.WriteMessage(websocket.BinaryMessage, payload)
+		if err != nil {
+			log.Print("Failed to send, attempting to retry")
+			attempts++
+		} else {
+			return
+		}
+	}
+
+}
+
+func (app *ConnectionHandler) SendSignal(messageType MessageType, payload []byte) {
+	currentSeqId := app.currentSendSequenceId.Load()
+	app.currentSendSequenceId.Add(1)
+
+	seqIdBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(seqIdBuf, uint32(currentSeqId))
+
+	msgPayload := append(append([]byte{messageType}, seqIdBuf...), payload...)
+
+	app.SendAnyWebsocket(msgPayload)
+}
+
+func (app *ConnectionHandler) ForwardPacketToWebsocket(conn *ProxyLocalConnection, payload []byte, clientId byte, sequenceId int64) {
+	app.SendWebsocketRoundRobinEncrypt(clientId, payload)
+
+	// Write to to be acknowledged
+	conn.toBeAcknowledgedPacketsMu.Lock()
+	conn.toBeAcknowledgedPackets[sequenceId] = payload
+	conn.toBeAcknowledgedPacketsMu.Unlock()
+}
+
+func (app *ConnectionHandler) HandleWebsocketMessage(conn *ProxyWebsocketConnection, messageType MessageType, message []byte) error {
+	if message[0] == 0 { // means network packet
+
+		if !conn.ready.Load() {
+			log.Print("ignored packet: connection is not ready")
+			return nil
+		}
+
+		// forward
+		clientId := message[1] // client ID
+
+		app.localConnectionsMutex.RLock()
+		localConnection, exists := app.localConnections[int(clientId)]
+		app.localConnectionsMutex.RUnlock()
+		if !exists {
+			log.Print("ignoring packet: client ID ", clientId, " not found")
+			return nil
+		}
+		// log.Print("received ", len(message)-2, " from websocket")
+
+		plaintext, err := Decrypt(conn.sharedSecret, message[2:])
+		if err != nil {
+			log.Print("error: failed to decrypt: ", err)
+			return nil
+		}
+
+		err = localConnection.QueueAndSend(plaintext)
+		if err != nil {
+			log.Print("error: failed to forward packet: ", err)
+			return nil
+		}
+	} else if message[0] == 1 { // means client ready
+
+		if !(conn.protocolCompletion.KyberHandshakeReceived) {
+			log.Print("error: cannot verify signature without kyber handshake")
+			return fmt.Errorf("cannot verify signature without kyber handshake")
+		}
+
+		log.Print("Connection reported established, need to verify key match")
+		log.Printf("handshake transcript signature (EdDSA): %x\n", message[1:])
+		valid := VerifySignature(CERTIFICATE_PUBLIC_KEY, conn.handshakeTranscript, message[1:])
+		if !valid {
+			log.Print("--- MAN IN THE MIDDLE TAMPERING DETECTED ---")
+			log.Fatal("Ending all connections immediately")
+			return fmt.Errorf("MITM attack detected")
+		}
+		log.Print("valid signature detected, trusting server")
+
+		// we need to verify key confirmation and transcript
+		transcriptHash := sha256.Sum256(conn.handshakeTranscript)
+		prk, err := hkdf.Extract(sha256.New, conn.sharedSecret, transcriptHash[:])
+		if err != nil {
+			log.Print("error: hkdf failed to extract: ", err)
+			return fmt.Errorf("hkdf failed to extract")
+		}
+		confirmKey, err := hkdf.Expand(sha256.New, prk, "confirm", 32)
+		if err != nil {
+			log.Print("error: hkdf failed to expand: ", err)
+			return fmt.Errorf("hkdf failed to expand")
+		}
+
+		log.Print("Derived key: ", len(confirmKey), " bytes")
+
+		mac := hmac.New(sha256.New, confirmKey)
+		mac.Write(conn.handshakeTranscript)
+		mac.Write([]byte("client"))
+		clientConfirm := mac.Sum(nil)
+
+		clientMac := clientConfirm
+
+		payload := append([]byte{5}, clientMac...) // 5 is key confirmation
+
+		conn.connection.WriteMessage(websocket.BinaryMessage, payload)
+
+		log.Print("sent confirmation to server: ", len(payload), " bytes")
+
+		conn.protocolCompletion.SignatureReceived = true
+
+	} else if message[0] == 2 { // server requested disconnect
+
+		if !conn.ready.Load() {
+			log.Print("error: cannot perform disconnect when connection is not ready")
+			return nil
+		}
+
+		clientId := message[1]
+
+		app.localConnectionsMutex.Lock()
+		localConnection, exists := app.localConnections[int(clientId)]
+
+		if !exists {
+			log.Print("ignoring disconnect: client ID ", clientId, " not found")
+			app.localConnectionsMutex.Unlock()
+			return nil
+		}
+
+		localConnection.localConnection.Close()
+		log.Print("closed connection ", clientId, " as requested by server")
+		delete(app.localConnections, int(clientId))
+		app.localConnectionsMutex.Unlock()
+
+		app.clientConnectionIDsRWMutex.Lock()
+		_, exists = app.clientConnectionIDs[int(clientId)]
+		if !exists {
+			log.Print("does not exist in clientid")
+			app.clientConnectionIDsRWMutex.Unlock()
+			return nil
+		}
+		delete(app.clientConnectionIDs, int(clientId))
+		app.clientConnectionIDsRWMutex.Unlock()
+		log.Print("deleted client id entry: ", clientId)
+	} else if message[0] == 3 { // means handshake data
+		log.Print("received handshake")
+		conn.handshakeTranscript = append(conn.handshakeTranscript, message...)
+		publicKeyBin := message[1:]
+		publicKey, err := conn.scheme.UnmarshalBinaryPublicKey(publicKeyBin)
+		if err != nil {
+			log.Print("error: handshake failed: failed to unmarshal key: ", err)
+			return fmt.Errorf("failed to unmarshal key")
+		}
+
+		ciphertext, sharedSecret, err := conn.scheme.Encapsulate(publicKey)
+		if err != nil {
+			log.Print("error: handshake failed: failed to encapsulate key: ", err)
+			return fmt.Errorf("failed to encapsulate key")
+		}
+
+		conn.sharedSecret = sharedSecret
+
+		conn.writeMutex.Lock()
+		payload := append([]byte{3}, ciphertext...)
+		conn.connection.WriteMessage(websocket.BinaryMessage, payload)
+		conn.handshakeTranscript = append(conn.handshakeTranscript, payload...)
+		conn.writeMutex.Unlock()
+		log.Print("wrote ciphertext")
+
+		conn.protocolCompletion.KyberHandshakeReceived = true
+
+	} else if message[0] == 6 {
+
+		if !(conn.protocolCompletion.KyberHandshakeReceived && conn.protocolCompletion.SignatureReceived) {
+			log.Print("error: cannot confirm key before kyber handshake and signature validation")
+			return fmt.Errorf("wrong order handshake")
+		}
+
+		serverMac := message[1:]
+
+		// derive key again
+		transcriptHash := sha256.Sum256(conn.handshakeTranscript)
+		prk, err := hkdf.Extract(sha256.New, conn.sharedSecret, transcriptHash[:])
+		if err != nil {
+			log.Print("error: hkdf failed to extract: ", err)
+		}
+		confirmKey, err := hkdf.Expand(sha256.New, prk, "confirm", 32)
+		if err != nil {
+			log.Print("error: hkdf failed to expand: ", err)
+		}
+
+		log.Print("Derived key: ", len(confirmKey), " bytes")
+
+		// write expected server mac
+		mac := hmac.New(sha256.New, confirmKey)
+		mac.Write(conn.handshakeTranscript)
+		mac.Write([]byte("server"))
+
+		if !hmac.Equal(serverMac, mac.Sum(nil)) {
+			log.Print("error: authenticity verification failed: HMAC mismatch, ending connection")
+			return fmt.Errorf("authentication failed")
+		} else {
+			conn.protocolCompletion.KeyConfirmationReceived = true
+			log.Print("passed key confirmation check")
+
+			if !(conn.protocolCompletion.KeyConfirmationReceived == true && conn.protocolCompletion.KyberHandshakeReceived == true && conn.protocolCompletion.SignatureReceived == true) {
+				log.Print("error: invalid handshake. skipped one or more steps")
+				return fmt.Errorf("not all steps complete")
+			} else {
+				log.Print("protocol handshake complete")
+			}
+
+			conn.ready.Store(true)
+			// find out index
+			app.wssConnectionsMutex.RLock()
+			index := slices.Index(app.wssConnections, conn)
+			app.wssConnectionsMutex.RUnlock()
+			if index != -1 {
+				app.activeConnectionIndexesMu.Lock()
+				app.activeConnectionIndexes = append(app.activeConnectionIndexes, index)
+				app.activeConnectionIndexesMu.Unlock()
+			}
+
+			log.Print("connection is ready")
+			conn.handshakeSucceeded.Store(true)
+			log.Print("marked handshake succeeded")
+
+		}
+	} else {
+		log.Print("error: unrecognized message type: ", message[0])
+	}
+}
+
 func (app *ConnectionHandler) HandleWebsocketRead(conn *ProxyWebsocketConnection) {
 	defer conn.connection.Close()
 	defer app.onSocketDied(conn)
@@ -151,20 +409,11 @@ func (app *ConnectionHandler) HandleWebsocketRead(conn *ProxyWebsocketConnection
 		return
 	}
 	payloadNonce := append([]byte{4}, nonce...)
-	app.SocketWriteMessage(conn, payloadNonce)
+	app.SendSignal(MessageTypeClientHello, nonce)
 	conn.handshakeTranscript = append(conn.handshakeTranscript, payloadNonce...)
 	log.Print("sent client hello nonce")
 
-	scheme := kyber768.Scheme()
-
 	// step-by-step protocol
-	completion := HandshakeProtocolCompletion{
-		KyberHandshakeReceived:  false,
-		SignatureReceived:       false,
-		KeyConfirmationReceived: false,
-	}
-
-	var clientMac []byte
 
 	for {
 		_, message, err := conn.connection.ReadMessage()
@@ -184,203 +433,6 @@ func (app *ConnectionHandler) HandleWebsocketRead(conn *ProxyWebsocketConnection
 			break
 		}
 
-		if message[0] == 0 { // means network packet
-
-			if !conn.ready.Load() {
-				log.Print("ignored packet: connection is not ready")
-				continue
-			}
-
-			// forward
-			clientId := message[1] // client ID
-
-			app.localConnectionsMutex.RLock()
-			localConnection, exists := app.localConnections[int(clientId)]
-			app.localConnectionsMutex.RUnlock()
-			if !exists {
-				log.Print("ignoring packet: client ID ", clientId, " not found")
-				continue
-			}
-			// log.Print("received ", len(message)-2, " from websocket")
-
-			plaintext, err := Decrypt(conn.sharedSecret, message[2:])
-			if err != nil {
-				log.Print("error: failed to decrypt: ", err)
-				continue
-			}
-
-			err = localConnection.QueueAndSend(plaintext)
-			if err != nil {
-				log.Print("error: failed to forward packet: ", err)
-				continue
-			}
-		} else if message[0] == 1 { // means client ready
-
-			if !(completion.KyberHandshakeReceived) {
-				log.Print("error: cannot verify signature without kyber handshake")
-				return
-			}
-
-			log.Print("Connection reported established, need to verify key match")
-			log.Printf("handshake transcript signature (EdDSA): %x\n", message[1:])
-			valid := VerifySignature(CERTIFICATE_PUBLIC_KEY, conn.handshakeTranscript, message[1:])
-			if !valid {
-				log.Print("--- MAN IN THE MIDDLE TAMPERING DETECTED ---")
-				log.Fatal("Ending all connections immediately")
-				return
-			}
-			log.Print("valid signature detected, trusting server")
-
-			// we need to verify key confirmation and transcript
-			transcriptHash := sha256.Sum256(conn.handshakeTranscript)
-			prk, err := hkdf.Extract(sha256.New, conn.sharedSecret, transcriptHash[:])
-			if err != nil {
-				log.Print("error: hkdf failed to extract: ", err)
-				return
-			}
-			confirmKey, err := hkdf.Expand(sha256.New, prk, "confirm", 32)
-			if err != nil {
-				log.Print("error: hkdf failed to expand: ", err)
-				return
-			}
-
-			log.Print("Derived key: ", len(confirmKey), " bytes")
-
-			mac := hmac.New(sha256.New, confirmKey)
-			mac.Write(conn.handshakeTranscript)
-			mac.Write([]byte("client"))
-			clientConfirm := mac.Sum(nil)
-
-			clientMac = clientConfirm
-
-			payload := append([]byte{5}, clientMac...) // 5 is key confirmation
-
-			conn.connection.WriteMessage(websocket.BinaryMessage, payload)
-
-			log.Print("sent confirmation to server: ", len(payload), " bytes")
-
-			completion.SignatureReceived = true
-
-		} else if message[0] == 2 { // server requested disconnect
-
-			if !conn.ready.Load() {
-				log.Print("error: cannot perform disconnect when connection is not ready")
-				continue
-			}
-
-			clientId := message[1]
-
-			app.localConnectionsMutex.Lock()
-			localConnection, exists := app.localConnections[int(clientId)]
-
-			if !exists {
-				log.Print("ignoring disconnect: client ID ", clientId, " not found")
-				app.localConnectionsMutex.Unlock()
-				continue
-			}
-
-			localConnection.localConnection.Close()
-			log.Print("closed connection ", clientId, " as requested by server")
-			delete(app.localConnections, int(clientId))
-			app.localConnectionsMutex.Unlock()
-
-			app.clientConnectionIDsRWMutex.Lock()
-			_, exists = app.clientConnectionIDs[int(clientId)]
-			if !exists {
-				log.Print("does not exist in clientid")
-				app.clientConnectionIDsRWMutex.Unlock()
-				continue
-			}
-			delete(app.clientConnectionIDs, int(clientId))
-			app.clientConnectionIDsRWMutex.Unlock()
-			log.Print("deleted client id entry: ", clientId)
-		} else if message[0] == 3 { // means handshake data
-			log.Print("received handshake")
-			conn.handshakeTranscript = append(conn.handshakeTranscript, message...)
-			publicKeyBin := message[1:]
-			publicKey, err := scheme.UnmarshalBinaryPublicKey(publicKeyBin)
-			if err != nil {
-				log.Print("error: handshake failed: failed to unmarshal key: ", err)
-				return
-			}
-
-			ciphertext, sharedSecret, err := scheme.Encapsulate(publicKey)
-			if err != nil {
-				log.Print("error: handshake failed: failed to encapsulate key: ", err)
-				return
-			}
-
-			conn.sharedSecret = sharedSecret
-
-			conn.writeMutex.Lock()
-			payload := append([]byte{3}, ciphertext...)
-			conn.connection.WriteMessage(websocket.BinaryMessage, payload)
-			conn.handshakeTranscript = append(conn.handshakeTranscript, payload...)
-			conn.writeMutex.Unlock()
-			log.Print("wrote ciphertext")
-
-			completion.KyberHandshakeReceived = true
-
-		} else if message[0] == 6 {
-
-			if !(completion.KyberHandshakeReceived && completion.SignatureReceived) {
-				log.Print("error: cannot confirm key before kyber handshake and signature validation")
-				return
-			}
-
-			serverMac := message[1:]
-
-			// derive key again
-			transcriptHash := sha256.Sum256(conn.handshakeTranscript)
-			prk, err := hkdf.Extract(sha256.New, conn.sharedSecret, transcriptHash[:])
-			if err != nil {
-				log.Print("error: hkdf failed to extract: ", err)
-			}
-			confirmKey, err := hkdf.Expand(sha256.New, prk, "confirm", 32)
-			if err != nil {
-				log.Print("error: hkdf failed to expand: ", err)
-			}
-
-			log.Print("Derived key: ", len(confirmKey), " bytes")
-
-			// write expected server mac
-			mac := hmac.New(sha256.New, confirmKey)
-			mac.Write(conn.handshakeTranscript)
-			mac.Write([]byte("server"))
-
-			if !hmac.Equal(serverMac, mac.Sum(nil)) {
-				log.Print("error: authenticity verification failed: HMAC mismatch, ending connection")
-				return
-			} else {
-				completion.KeyConfirmationReceived = true
-				log.Print("passed key confirmation check")
-
-				if !(completion.KeyConfirmationReceived == true && completion.KyberHandshakeReceived == true && completion.SignatureReceived == true) {
-					log.Print("error: invalid handshake. skipped one or more steps")
-					return
-				} else {
-					log.Print("protocol handshake complete")
-				}
-
-				conn.ready.Store(true)
-				// find out index
-				app.wssConnectionsMutex.RLock()
-				index := slices.Index(app.wssConnections, conn)
-				app.wssConnectionsMutex.RUnlock()
-				if index != -1 {
-					app.activeConnectionIndexesMu.Lock()
-					app.activeConnectionIndexes = append(app.activeConnectionIndexes, index)
-					app.activeConnectionIndexesMu.Unlock()
-				}
-
-				log.Print("connection is ready")
-				conn.handshakeSucceeded.Store(true)
-				log.Print("marked handshake succeeded")
-
-			}
-		} else {
-			log.Print("error: unrecognized message type: ", message[0])
-		}
 	}
 }
 
@@ -473,7 +525,7 @@ func (app *ConnectionHandler) Initialize() {
 	go app.MultiplexingScalingLoop()
 }
 
-func (app *ConnectionHandler) SocketWriteMessage(socket *ProxyWebsocketConnection, message []byte) error {
+func (app *ConnectionHandler) SocketWriteMessageRaw(socket *ProxyWebsocketConnection, message []byte) error {
 	socket.writeMutex.Lock()
 	// log.Print("forwarding ", len(message), " to websocket")
 	err := socket.connection.WriteMessage(websocket.BinaryMessage, message)
@@ -705,10 +757,8 @@ func (app *ConnectionHandler) HandleNewConnection(conn net.Conn) {
 			log.Print("detected tcp socket closed. error: ", err)
 			if clientId != -1 {
 				log.Print("writing disconnect to server")
-				writeErr := app.SocketWriteMessage(wsSocket, []byte{2, byte(clientId)})
-				if writeErr != nil {
-					log.Print("error: unable to write disconnect: ", writeErr)
-				}
+				//writeErr := app.SocketWriteMessage(wsSocket, []byte{2, byte(clientId)})
+				app.SendSignal(MessageTypeStreamDisconnect, []byte{byte(clientId)})
 
 				// make sure to unreserve it
 				app.clientConnectionIDsRWMutex.Lock()

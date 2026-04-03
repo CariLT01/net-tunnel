@@ -1,6 +1,6 @@
 module github.com/CariLT01/lt-vpn2-server
 
-go 1.25.0
+go 1.25.8
 
 require (
 	github.com/cloudflare/circl v1.6.3
@@ -10,3 +10,7 @@ require (
 )
 
 require golang.org/x/sys v0.42.0 // indirect
+
+require github.com/CariLT01/net-tunnel-common v0.0.0
+
+replace github.com/CariLT01/net-tunnel-common => ../common

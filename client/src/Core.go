@@ -5,20 +5,22 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/cloudflare/circl/kem"
 	"github.com/gorilla/websocket"
 )
 
 type ProxyLocalConnection struct {
-	localConnection    net.Conn
-	wssConnectionIndex int
-	destination        string
-	wssConnectionid    int
+	localConnection net.Conn
 
 	// Reordering
 	sequenceId         atomic.Int64
 	expectedSequenceId atomic.Int64
 	queuedPackets      map[int64][]byte
 	queuedPacketsMu    sync.RWMutex
+
+	// Acknowledgement and retransmition
+	toBeAcknowledgedPackets   map[int64][]byte
+	toBeAcknowledgedPacketsMu sync.RWMutex
 }
 
 type ProxyWebsocketConnection struct {
@@ -31,6 +33,9 @@ type ProxyWebsocketConnection struct {
 	sharedSecret              []byte
 
 	handshakeTranscript []byte
+
+	protocolCompletion HandshakeProtocolCompletion
+	scheme             kem.Scheme
 }
 
 type ConnectionHandler struct {
@@ -51,6 +56,16 @@ type ConnectionHandler struct {
 
 	activeConnectionIndexes   []int
 	activeConnectionIndexesMu sync.RWMutex
+
+	// Retransmission
+	toBeRetransmittedPackets [][]byte
+
+	// Acknowledgement for SIGNALS
+	toBeAcknowledgedSignalPackets   map[int64][]byte
+	toBeAcknowledgedSignalPacketsMu sync.RWMutex
+
+	currentSendSequenceId      atomic.Int64
+	lastAcknowledgedSequenceId atomic.Int64
 }
 
 type ProxyClient struct {

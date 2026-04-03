@@ -1,6 +1,6 @@
 module github.com/CariLT01/lt-vpn
 
-go 1.25.0
+go 1.25.8
 
 require (
 	fyne.io/fyne/v2 v2.7.3

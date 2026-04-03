@@ -1,4 +1,4 @@
-package main
+package shared
 
 import (
 	"crypto/aes"
@@ -66,13 +66,13 @@ func Decrypt(key, ciphertext []byte) ([]byte, error) {
 	return plaintext, nil
 }
 
-func Sign(key string, message []byte) []byte {
-	if key == "" {
-		log.Fatal("Unable to sign: empty key: ", key)
+func VerifySignature(pubKey string, message, signature []byte) bool {
+	if pubKey == "" {
+		log.Fatal("no public key")
 	}
-	keyBytes, err := base64.StdEncoding.DecodeString(key)
+	pubKeyBytes, err := base64.StdEncoding.DecodeString(pubKey)
 	if err != nil {
-		log.Fatal("secret is not valid base64")
+		log.Fatal("failed to decode public key base64")
 	}
-	return ed25519.Sign(ed25519.PrivateKey(keyBytes), message)
+	return ed25519.Verify(pubKeyBytes, message, signature)
 }

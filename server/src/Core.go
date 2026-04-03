@@ -1,11 +1,11 @@
 package main
 
 import (
-	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/CariLT01/net-tunnel-common/shared"
 	"github.com/gorilla/websocket"
 	"golang.org/x/time/rate"
 )
@@ -13,35 +13,19 @@ import (
 var RATE_LIMIT_MBPS = 200_000_000
 var RATE_LIMIT_BURST_MBPS = 500_000_000
 
-type WebsocketConnection struct {
-	connection   *websocket.Conn
-	writeMutex   sync.Mutex
-	sharedSecret []byte
-
-	handshakeTranscript []byte
-	ready               bool
-}
-
-type TCPConnection struct {
-	conn *net.Conn
-
-	ExpectedSequenceID atomic.Int64
-	QueuedPackets      map[int64][]byte
-	QueuedPacketsMu    sync.RWMutex
-
-	SendSequenceId atomic.Int64
-}
-
 type Session struct {
-	clientIDs        map[int]*TCPConnection
-	clientIDsMu      sync.RWMutex
-	wssConnections   []*WebsocketConnection
-	wssConnectionsMu sync.RWMutex
-	lastActiveTime   time.Time
-	clientsActive    atomic.Int32
+	clientIDs      map[int]*shared.TCPStream
+	clientIDsMu    sync.RWMutex
+	multiplexer    *shared.WebsocketMultiplexer
+	lastActiveTime time.Time
+	clientsActive  atomic.Int32
 
 	outboundLimiter    *rate.Limiter
 	roundRobinIterator atomic.Int64
+}
+
+type ServerTCPStream struct {
+	*shared.TCPStream
 }
 
 type Server struct {
@@ -55,13 +39,11 @@ type Server struct {
 
 func NewSession() *Session {
 	return &Session{
-		clientIDs:        make(map[int]*TCPConnection),
-		clientIDsMu:      sync.RWMutex{},
-		lastActiveTime:   time.Now(),
-		clientsActive:    atomic.Int32{},
-		wssConnections:   make([]*WebsocketConnection, 0),
-		wssConnectionsMu: sync.RWMutex{},
-		outboundLimiter:  rate.NewLimiter(rate.Limit(RATE_LIMIT_MBPS/8), RATE_LIMIT_BURST_MBPS/8),
+		clientIDs:       make(map[int]*shared.TCPStream),
+		clientIDsMu:     sync.RWMutex{},
+		lastActiveTime:  time.Now(),
+		clientsActive:   atomic.Int32{},
+		outboundLimiter: rate.NewLimiter(rate.Limit(RATE_LIMIT_MBPS/8), RATE_LIMIT_BURST_MBPS/8),
 	}
 }
 

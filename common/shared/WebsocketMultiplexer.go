@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/cloudflare/circl/kem"
 	"github.com/cloudflare/circl/kem/kyber/kyber768"
@@ -45,6 +46,7 @@ type WebsocketMultiplexer struct {
 	SignalUnordered     map[uint32]*SignalDecodedPacket
 
 	/* RESEND */
+	QueuedForResendMu sync.RWMutex
 	QueuedForResend   [][]byte   // Retry when a connection establishes again
 	QuickRetryQueue   []*ToRetry // Retry on the next "retry" tick
 	QuickRetryQueueMu sync.RWMutex
@@ -156,22 +158,24 @@ func (multiplexer *WebsocketMultiplexer) SendDataOnAnyWithIndex(currentCounter u
 
 	encodedPayload := append(seqIdBuf, payload...)
 
-	log.Print("write on mx seq id ", currentDataSeqId, " data ", encodedPayload)
+	log.Print("write on mx seq id ", currentDataSeqId)
 	err := targetStream.WriteData(encodedPayload)
 	if err != nil {
 		log.Print("error: failed to write: queueing to quick retry queue")
+		multiplexer.QuickRetryQueueMu.Lock()
 		multiplexer.QuickRetryQueue = append(multiplexer.QuickRetryQueue, &ToRetry{
 			FirstIndex:         targetStreamIndex,
 			CurrentIndex:       targetStreamIndex,
-			Data:               encodedPayload,
+			Data:               payload,
 			OriginalSequenceId: currentDataSeqId,
 		})
+		multiplexer.QuickRetryQueueMu.Unlock()
 	} else {
 		multiplexer.UnacknowledgedPacketMu.Lock()
 		log.Print("write current data seq id ", currentDataSeqId, " to be acknowledged")
 		multiplexer.UnacknowledgedPackets[currentDataSeqId] = &UnacknowledgedPacket{
 			WebsocketIndex: targetStreamIndex,
-			Payload:        encodedPayload,
+			Payload:        payload,
 		}
 		multiplexer.UnacknowledgedPacketMu.Unlock()
 	}
@@ -262,6 +266,8 @@ func (multiplexer *WebsocketMultiplexer) SetActive(stream *WSStream) {
 	log.Print("set stream to active: ", stream.Index)
 	multiplexer.ActiveStreamIndexes = append(multiplexer.ActiveStreamIndexes, stream.Index)
 	multiplexer.ActiveStreamIndexesMu.Unlock()
+
+	multiplexer.DoQuickRetry()
 }
 
 func (multiplexer *WebsocketMultiplexer) SetInactive(stream *WSStream) error {
@@ -338,12 +344,14 @@ func (multiplexer *WebsocketMultiplexer) ReorderSignalPackets(newPacket *Decoded
 	}
 
 	if signalpacket.SignalSequenceId > multiplexer.SignalExpectedSeqId.Load()+500 {
-		log.Print("warn: packet arrived way too early!")
+		log.Print("warn: packet arrived way too early! expected: ", multiplexer.SignalExpectedSeqId.Load(), " current: ", signalpacket.SignalSequenceId)
 		return
 	}
 
 	multiplexer.SignalUnorderedMu.Lock()
 	defer multiplexer.SignalUnorderedMu.Unlock()
+
+	log.Print("added packet seq id: ", signalpacket.SequenceId)
 
 	multiplexer.SignalUnordered[signalpacket.SignalSequenceId] = signalpacket
 
@@ -365,4 +373,38 @@ func (multiplexer *WebsocketMultiplexer) ReorderSignalPackets(newPacket *Decoded
 		multiplexer.SignalExpectedSeqId.Add(1)
 	}
 
+}
+
+func (multiplexer *WebsocketMultiplexer) DoQuickRetry() {
+	multiplexer.QueuedForResendMu.Lock()
+	defer multiplexer.QueuedForResendMu.Unlock()
+
+	for i, pckt := range multiplexer.QueuedForResend {
+		log.Print("attempting to resend packet: ", i)
+		multiplexer.SendDataRawOnAny(pckt)
+	}
+
+	multiplexer.QueuedForResend = multiplexer.QueuedForResend[:0]
+}
+
+func (multiplexer *WebsocketMultiplexer) DoQuickResendLoop() {
+	ticker := time.NewTicker(250 * time.Millisecond)
+
+	for range ticker.C {
+
+		multiplexer.QuickRetryQueueMu.Lock()
+
+		for i, pckt := range multiplexer.QuickRetryQueue {
+			log.Print("attempt to quick retry resend packet: ", i)
+			multiplexer.SendDataRawOnAny(pckt.Data)
+		}
+
+		multiplexer.QuickRetryQueue = multiplexer.QuickRetryQueue[:0]
+		multiplexer.QuickRetryQueueMu.Unlock()
+	}
+}
+
+func (multiplexer *WebsocketMultiplexer) Initialize() {
+	log.Print("initializing websocket multiplexer")
+	go multiplexer.DoQuickResendLoop()
 }

@@ -90,8 +90,12 @@ func (app *ConnectionHandler) HandleNetworkData(decodedPacket *shared.DecodedPac
 		return
 	}
 
+	//log.Print("originally received pre-decoded packet: ", base64.StdEncoding.EncodeToString(decodedPacket.Payload))
+
 	clientId := decodedPacket.Payload[0]
 	messagePayload := decodedPacket.Payload[1:]
+
+	//log.Print("message payload: ", base64.StdEncoding.EncodeToString(messagePayload))
 
 	app.localConnectionsMutex.RLock()
 	localConnection, exists := app.localConnections[int(clientId)]
@@ -118,6 +122,7 @@ func (app *ConnectionHandler) HandleWebsocketMessage(signalpacket *shared.Signal
 
 		log.Print("Connection reported established, need to verify key match")
 		log.Printf("handshake transcript signature (EdDSA): %x\n", signalpacket.Payload)
+		log.Print("handshake transcript: ", app.multiplexer.HandshakeTranscript)
 		valid := VerifySignature(CERTIFICATE_PUBLIC_KEY, app.multiplexer.HandshakeTranscript, signalpacket.Payload)
 		if !valid {
 			log.Print("--- MAN IN THE MIDDLE TAMPERING DETECTED ---")
@@ -293,9 +298,8 @@ func (app *ConnectionHandler) HandleWebsocketRead(conn *shared.WSStream) {
 				log.Print("error: failed to generate nonce")
 				return
 			}
-			payloadNonce := append([]byte{4}, nonce...)
 			app.multiplexer.SendSignal(shared.MessageTypeClientHello, nonce)
-			conn.AppendToTranscript(payloadNonce)
+			app.multiplexer.HandshakeTranscript = append(app.multiplexer.HandshakeTranscript, nonce...)
 			log.Print("sent client hello nonce")
 
 			app.multiplexer.IsDoingHandshake.Store(true)
@@ -435,6 +439,8 @@ func (app *ConnectionHandler) Initialize() {
 	}
 
 	go app.MultiplexingScalingLoop()
+
+	app.multiplexer.Initialize()
 }
 
 func (app *ConnectionHandler) SocketWriteMessageRaw(socket *ProxyWebsocketConnection, message []byte) error {
@@ -479,7 +485,7 @@ func (app *ConnectionHandler) GetConnectedCount() int {
 	app.localConnectionsMutex.RLock()
 	defer app.localConnectionsMutex.RUnlock()
 	c := 0
-	for _, _ = range app.localConnections {
+	for range app.localConnections {
 		c++
 	}
 	return c
@@ -576,6 +582,12 @@ func (app *ConnectionHandler) HandleNewConnection(conn net.Conn) {
 				delete(app.clientConnectionIDs, clientId)
 				app.clientConnectionIDsRWMutex.Unlock()
 
+				// make sure to delete the connection
+				app.localConnectionsMutex.Lock()
+				log.Print("delete from map: ", clientId)
+				delete(app.localConnections, clientId)
+				app.localConnectionsMutex.Unlock()
+
 			}
 			return
 		}
@@ -583,6 +595,7 @@ func (app *ConnectionHandler) HandleNewConnection(conn net.Conn) {
 		// sequence id
 
 		encodedPacket := localConnection.EncodePacketPayload(byte(clientId), buf[:n])
+		//log.Print("sending from TCP: ", base64.StdEncoding.EncodeToString(encodedPacket))
 		app.multiplexer.SendData(shared.MessageTypeNetwork, encodedPacket)
 
 		// log.Print("received ", n, " bytes from TCP")

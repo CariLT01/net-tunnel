@@ -34,6 +34,7 @@ func (stream *TCPStream) OnPacketReceived(packet []byte, sequenceId uint32) {
 	}
 
 	stream.queuedPacketsMu.Lock()
+	log.Print("add queued packet: ", sequenceId)
 	stream.queuedPackets[sequenceId] = packet
 	defer stream.queuedPacketsMu.Unlock()
 
@@ -41,11 +42,12 @@ func (stream *TCPStream) OnPacketReceived(packet []byte, sequenceId uint32) {
 		expectedSequenceIdCurrent := stream.expectedSequenceId.Load()
 		currentMessage, exists := stream.queuedPackets[expectedSequenceIdCurrent]
 		if !exists {
-			log.Print("found end of reordering stream")
+			log.Print("found end of reordering stream: expected seq id: ", expectedSequenceIdCurrent)
 			break
 		}
 
-		
+		log.Print("process seq id: ", expectedSequenceIdCurrent)
+		//log.Print("writing to TCP: ", base64.StdEncoding.EncodeToString(currentMessage))
 		stream.Connection.Write(currentMessage)
 		delete(stream.queuedPackets, expectedSequenceIdCurrent)
 		stream.expectedSequenceId.Add(1)
@@ -66,7 +68,7 @@ func (stream *TCPStream) EncodePacketPayload(clientId byte, packetData []byte) [
 
 func (stream *TCPStream) DecodePacketPayload(rawData []byte) (uint32, []byte) {
 	seqId := rawData[:4]
-	packetData := rawData[5:]
+	packetData := rawData[4:]
 
 	sequenceId := binary.BigEndian.Uint32(seqId)
 
@@ -75,13 +77,16 @@ func (stream *TCPStream) DecodePacketPayload(rawData []byte) (uint32, []byte) {
 
 func NewTCPStream(connection net.Conn) *TCPStream {
 	return &TCPStream{
-		Connection: connection,
-		sendSequenceId: atomic.Uint32{},
-		expectedSequenceId: atomic.Uint32{},
-		queuedPackets: make(map[uint32][]byte),
-		queuedPacketsMu: sync.RWMutex{},
-		toBeAcknowledgedPackets: make(map[uint32][]byte),
+		Connection:                connection,
+		sendSequenceId:            atomic.Uint32{},
+		expectedSequenceId:        atomic.Uint32{},
+		queuedPackets:             make(map[uint32][]byte),
+		queuedPacketsMu:           sync.RWMutex{},
+		toBeAcknowledgedPackets:   make(map[uint32][]byte),
 		toBeAcknowledgedPacketsMu: sync.RWMutex{},
-	
 	}
+}
+
+func (stream *TCPStream) IncrementExpectedSeqId() {
+	stream.expectedSequenceId.Add(1)
 }

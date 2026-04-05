@@ -2,8 +2,10 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"os"
 	"time"
 
 	"fyne.io/fyne/v2/app"
@@ -16,6 +18,23 @@ func fyneApp() {
 
 	myWindow.SetContent(widget.NewLabel("Hello, World!"))
 	myWindow.ShowAndRun()
+}
+
+func init() {
+	file, err := os.OpenFile(
+		"client.log",
+		os.O_CREATE|os.O_WRONLY|os.O_TRUNC,
+		0666,
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Write to both file and stdout
+	mw := io.MultiWriter(os.Stdout, file)
+
+	log.SetOutput(mw)
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 }
 
 func main() {

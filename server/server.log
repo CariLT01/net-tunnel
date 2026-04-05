@@ -1,0 +1,11 @@
+2026/04/05 19:20:49 Main.go:35: serving
+2026/04/05 19:20:50 IdentityTokenProvider.go:68: detected invalid identity token
+2026/04/05 19:20:50 server.go:584: invalid identity token or identity token does not match session
+2026/04/05 19:20:51 IdentityTokenProvider.go:68: detected invalid identity token
+2026/04/05 19:20:51 server.go:584: invalid identity token or identity token does not match session
+2026/04/05 19:20:52 IdentityTokenProvider.go:68: detected invalid identity token
+2026/04/05 19:20:52 server.go:584: invalid identity token or identity token does not match session
+2026/04/05 19:20:53 IdentityTokenProvider.go:68: detected invalid identity token
+2026/04/05 19:20:53 server.go:584: invalid identity token or identity token does not match session
+2026/04/05 19:20:54 IdentityTokenProvider.go:68: detected invalid identity token
+2026/04/05 19:20:54 server.go:584: invalid identity token or identity token does not match session

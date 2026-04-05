@@ -104,6 +104,10 @@ func GetDialTarget(msg []byte) (string, string, error) {
 	return "", "", fmt.Errorf("could not determine target host")
 }
 
+func (session *Session) Initialize() {
+	session.multiplexer.Initialize()
+}
+
 func (session *Session) HandleTCPConnection(conn *shared.TCPStream, wsConn *shared.WSStream, clientId int) {
 	defer conn.Connection.Close()
 	defer func() {
@@ -176,6 +180,7 @@ func (session *Session) ProcessSignalPacket(signalpacket *shared.SignalDecodedPa
 		log.Print("encryption handshake complete")
 		log.Print("shared secret length: ", len(sharedSecret))
 		log.Print("transcript signature: ", transcriptSignature)
+		log.Print("transcript: ", session.multiplexer.HandshakeTranscript)
 		session.multiplexer.SharedSecret = sharedSecret
 		session.multiplexer.ProtocolCompletion.EncryptionEstablished = true
 
@@ -417,6 +422,7 @@ func (session *Session) HandleWebsocketLoop(conn *shared.WSStream) {
 
 					establishedMessageEncoded := tcpConnObj.EncodePacketPayload(clientID, msgEstablished)
 					session.multiplexer.SendData(shared.MessageTypeNetwork, establishedMessageEncoded)
+					tcpConnObj.IncrementExpectedSeqId()
 
 				} else {
 
@@ -534,6 +540,7 @@ func (server *Server) HandleSessionCreationRequest(w http.ResponseWriter, r *htt
 			}
 
 			session := NewSession()
+			session.Initialize()
 			server.sessionsMu.Lock()
 			server.sessions[int(sessionId.Int64())] = session
 			server.sessionsMu.Unlock()

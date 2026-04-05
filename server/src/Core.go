@@ -44,6 +44,7 @@ func NewSession() *Session {
 		lastActiveTime:  time.Now(),
 		clientsActive:   atomic.Int32{},
 		outboundLimiter: rate.NewLimiter(rate.Limit(RATE_LIMIT_MBPS/8), RATE_LIMIT_BURST_MBPS/8),
+		multiplexer:     shared.NewWebsocketMultiplexer(),
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/CariLT01/net-tunnel-common/shared"
 	"github.com/cloudflare/circl/kem"
 	"github.com/gorilla/websocket"
 )
@@ -34,13 +35,12 @@ type ProxyWebsocketConnection struct {
 
 	handshakeTranscript []byte
 
-	protocolCompletion HandshakeProtocolCompletion
-	scheme             kem.Scheme
+	scheme kem.Scheme
 }
 
 type ConnectionHandler struct {
-	wssConnections             []*ProxyWebsocketConnection
-	localConnections           map[int]*ProxyLocalConnection
+	multiplexer                *shared.WebsocketMultiplexer
+	localConnections           map[int]*shared.TCPStream
 	localConnectionsMutex      sync.RWMutex
 	wssConnectionsMutex        sync.RWMutex
 	clientConnectionIDs        map[int]struct{}
@@ -74,8 +74,7 @@ type ProxyClient struct {
 
 func NewConnectionHandler() *ConnectionHandler {
 	return &ConnectionHandler{
-		wssConnections:             make([]*ProxyWebsocketConnection, 0),
-		localConnections:           make(map[int]*ProxyLocalConnection),
+		localConnections:           make(map[int]*shared.TCPStream),
 		localConnectionsMutex:      sync.RWMutex{},
 		wssConnectionsMutex:        sync.RWMutex{},
 		clientConnectionIDs:        make(map[int]struct{}),
@@ -88,5 +87,7 @@ func NewConnectionHandler() *ConnectionHandler {
 
 		activeConnectionIndexes:   make([]int, 0),
 		activeConnectionIndexesMu: sync.RWMutex{},
+
+		multiplexer: shared.NewWebsocketMultiplexer(),
 	}
 }

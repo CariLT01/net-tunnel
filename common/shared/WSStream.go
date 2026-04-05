@@ -96,4 +96,20 @@ func (stream *WSStream) SetSharedSecret(secret []byte) {
 }
 func (stream *WSStream) GetSharedSecret() []byte { return stream.sharedSecret }
 
-func (stream *WSStream) GetProtocolCompletion() *HandshakeProtocolCompletion { return &stream.protocolCompletion }
+func (stream *WSStream) GetProtocolCompletion() *HandshakeProtocolCompletion {
+	return &stream.protocolCompletion
+}
+
+func (stream *WSStream) SetHandshakeSucceeded(v bool) {
+	stream.handshakeSucceeded.Store(v)
+}
+
+func (stream *WSStream) GetHandshakeSucceeded() bool { return stream.handshakeSucceeded.Load() }
+
+func (stream *WSStream) SetIntentionallyDisconnected(v bool) {
+	stream.intentionallyDisconnected.Store(v)
+}
+
+func (stream *WSStream) GetIntentionallyDisconnected() bool {
+	return stream.intentionallyDisconnected.Load()
+}

@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -33,14 +34,11 @@ type SessionCreationResponse struct {
 	IdentityToken *string `json:"identityToken"`
 }
 
-
 type HandshakeProtocolCompletion struct {
 	ClientHelloReceived   bool
 	EncryptionEstablished bool
 	KeyConfirmed          bool
 }
-
-
 
 func GetDialTarget(msg []byte) (string, string, error) {
 	// Split headers from the first line
@@ -154,180 +152,155 @@ func (session *Session) limiterWait(limiter *rate.Limiter, n int) error {
 }
 
 func (session *Session) ProcessSignalPacket(signalpacket *shared.SignalDecodedPacket) shared.PacketProcessingResult {
-		if signalpacket.MessageType == shared.MessageTypeHandshake  {
+	if signalpacket.MessageType == shared.MessageTypeHandshake {
 
+		if !session.multiplexer.ProtocolCompletion.ClientHelloReceived {
+			log.Print("error: protocol handshake failed: cannot establish encryption before client hello")
+			return shared.PacketProcessingDisconnect
+		}
 
-			if !session.multiplexer.ProtocolCompletion.ClientHelloReceived {
-				log.Print("error: protocol handshake failed: cannot establish encryption before client hello")
-				return shared.PacketProcessingDisconnect
-			}
+		session.multiplexer.HandshakeTranscript = append(session.multiplexer.HandshakeTranscript, signalpacket.Payload...)
+		//conn.AppendToTranscript(signalpacket.Payload)
+		ciphertext := signalpacket.Payload
+		sharedSecret, err := session.multiplexer.Scheme.Decapsulate(session.multiplexer.PrivateKey, ciphertext)
+		if err != nil {
+			log.Print("error: handshake failed: decapsulate failed: ", err)
+			return shared.PacketProcessingDisconnect
+		}
+		session.multiplexer.SharedSecret = sharedSecret
 
-			session.multiplexer.HandshakeTranscript = append(session.multiplexer.HandshakeTranscript, signalpacket.Payload...)
-			//conn.AppendToTranscript(signalpacket.Payload)
-			ciphertext := signalpacket.Payload
-			sharedSecret, err := session.multiplexer.Scheme.Decapsulate(session.multiplexer.PrivateKey, ciphertext)
-			if err != nil {
-				log.Print("error: handshake failed: decapsulate failed: ", err)
-				return shared.PacketProcessingDisconnect
-			}
-			session.multiplexer.SharedSecret = sharedSecret
+		transcriptSignature := Sign(CERTIFICATE_PRIVATE_KEY, session.multiplexer.HandshakeTranscript)
 
-			transcriptSignature := Sign(CERTIFICATE_PRIVATE_KEY, session.multiplexer.HandshakeTranscript)
+		session.multiplexer.SendSignal(shared.MessageTypeSignature, transcriptSignature)
 
-			
+		log.Print("encryption handshake complete")
+		log.Print("shared secret length: ", len(sharedSecret))
+		log.Print("transcript signature: ", transcriptSignature)
+		session.multiplexer.SharedSecret = sharedSecret
+		session.multiplexer.ProtocolCompletion.EncryptionEstablished = true
 
-			session.multiplexer.SendSignal(shared.MessageTypeSignature, transcriptSignature)
+	} else if signalpacket.MessageType == shared.MessageTypeStreamDisconnect {
 
-			log.Print("encryption handshake complete")
-			log.Print("shared secret length: ", len(sharedSecret))
-			log.Print("transcript signature: ", transcriptSignature)
-			session.multiplexer.SharedSecret = sharedSecret
-			session.multiplexer.ProtocolCompletion.EncryptionEstablished = true
+		if !session.multiplexer.Ready.Load() {
+			log.Print("cannot disconnect TCP connection with an unready connection")
+			return shared.PacketProcessingDisconnect
+		}
 
-
-		} else if signalpacket.MessageType == shared.MessageTypeStreamDisconnect {
-
-			if !session.multiplexer.Ready.Load() {
-				log.Print("cannot disconnect TCP connection with an unready connection")
-				return shared.PacketProcessingDisconnect
-			}
-
-			clientID := signalpacket.Payload[0]
-			session.clientIDsMu.Lock()
-			tcpConn, exists := session.clientIDs[int(clientID)]
-			if !exists {
-				session.clientIDsMu.Unlock()
-				log.Print("error: attempt to disconnect tcp conn that doesn't exist")
-				return shared.PacketProcessingSkipped
-			}
-			tcpConn.Connection.Close()
-			delete(session.clientIDs, int(clientID))
+		clientID := signalpacket.Payload[0]
+		session.clientIDsMu.Lock()
+		tcpConn, exists := session.clientIDs[int(clientID)]
+		if !exists {
 			session.clientIDsMu.Unlock()
-			log.Print("deleted stream ", clientID)
-
-		} else if signalpacket.MessageType == shared.MessageTypeClientHello {
-
-			log.Print("received client hello nonce")
-			session.multiplexer.HandshakeTranscript = append(session.multiplexer.HandshakeTranscript, signalpacket.Payload...)
-
-			publicKeyBin, err := session.multiplexer.PublicKey.MarshalBinary()
-			if err != nil {
-				log.Print("error: unable to pack public key", err)
-				return shared.PacketProcessingDisconnect
-			}
-
-			// send public key
-			log.Print("writing public key")
-			
-			payload := publicKeyBin
-
-			session.multiplexer.HandshakeTranscript = append(session.multiplexer.HandshakeTranscript, payload...)
-			session.multiplexer.SendSignal(shared.MessageTypeHandshake, payload)
-
-			session.multiplexer.ProtocolCompletion.ClientHelloReceived = true
-		} else if signalpacket.MessageType == shared.MessageTypeReady {
-			log.Print("received key confirmation message")
-
-			if !(session.multiplexer.ProtocolCompletion.ClientHelloReceived && session.multiplexer.ProtocolCompletion.EncryptionEstablished) {
-				log.Print("cannot confirm key without client hello and encryption establishment")
-				return shared.PacketProcessingDisconnect
-			}
-
-			transcriptHash := sha256.Sum256(session.multiplexer.HandshakeTranscript)
-			prk, err := hkdf.Extract(sha256.New, session.multiplexer.SharedSecret, transcriptHash[:])
-			if err != nil {
-				log.Print("error: hkdf failed to extract: ", err)
-			}
-			confirmKey, err := hkdf.Expand(sha256.New, prk, "confirm", 32)
-			if err != nil {
-				log.Print("error: hkdf failed to expand: ", err)
-			}
-
-			// my message
-			mac := hmac.New(sha256.New, confirmKey)
-			mac.Write(session.multiplexer.HandshakeTranscript)
-			mac.Write([]byte("server"))
-
-			macSum := mac.Sum(nil)
-
-			// confirm client message
-			macClient := hmac.New(sha256.New, confirmKey)
-			macClient.Write(session.multiplexer.HandshakeTranscript)
-			macClient.Write([]byte("client"))
-
-			macClientSum := macClient.Sum(nil)
-
-			if !hmac.Equal(macClientSum, signalpacket.Payload) {
-				log.Print("error: key confirmation do not match, ending handshake")
-				return shared.PacketProcessingDisconnect
-			} else {
-				log.Print("key confirmation matches")
-			}
-
-			// send back the confirmation
-			// 6 -- final message
-
-			session.multiplexer.SendSignal(shared.MessageTypeReady, macSum)
-
-			log.Print("wrote server Mac, handshake complete")
-
-			session.multiplexer.ProtocolCompletion.KeyConfirmed = true
-
-			handshakeCompletion := session.multiplexer.ProtocolCompletion
-
-			if !(handshakeCompletion.KeyConfirmed && handshakeCompletion.ClientHelloReceived) {
-				log.Print("error: protocol handshake failed: one or more steps skipped")
-				return shared.PacketProcessingDisconnect
-			} else {
-				log.Print("protocol established")
-			}
-
-			session.multiplexer.Ready.Store(true)
-
-		} else {
-			log.Print("error: unrecognized message type: ", signalpacket.MessageType)
+			log.Print("error: attempt to disconnect tcp conn that doesn't exist")
 			return shared.PacketProcessingSkipped
 		}
-		return shared.PacketProcessingOK
+		tcpConn.Connection.Close()
+		delete(session.clientIDs, int(clientID))
+		session.clientIDsMu.Unlock()
+		log.Print("deleted stream ", clientID)
 
-}
+	} else if signalpacket.MessageType == shared.MessageTypeClientHello {
 
-func (session *Session) ReorderSignalPackets(newPacket *shared.DecodedPacket, processFunc func(signalpacket *shared.SignalDecodedPacket) shared.PacketProcessingResult) {
-	signalpacket := session.multiplexer.DecodedSignalPacket(newPacket)
+		log.Print("received client hello nonce")
+		session.multiplexer.HandshakeTranscript = append(session.multiplexer.HandshakeTranscript, signalpacket.Payload...)
 
-	if signalpacket.SignalSequenceId < session.multiplexer.SignalExpectedSeqId.Load() {
-		log.Print("warn: packet arrived too late")
-		return
-	}
+		publicKeyBin, err := session.multiplexer.PublicKey.MarshalBinary()
+		if err != nil {
+			log.Print("error: unable to pack public key", err)
+			return shared.PacketProcessingDisconnect
+		}
 
-	if signalpacket.SignalSequenceId > session.multiplexer.SignalExpectedSeqId.Load() + 500 {
-		log.Print("warn: packet arrived way too early!")
-		return
-	}
+		// send public key
+		log.Print("writing public key")
 
-	session.multiplexer.SignalUnorderedMu.Lock()
-	defer session.multiplexer.SignalUnorderedMu.Unlock()
+		payload := publicKeyBin
 
-	session.multiplexer.SignalUnordered[signalpacket.SignalSequenceId] = signalpacket
+		session.multiplexer.HandshakeTranscript = append(session.multiplexer.HandshakeTranscript, payload...)
+		session.multiplexer.SendSignal(shared.MessageTypeHandshake, payload)
 
-	for {
-		currentSequenceId := session.multiplexer.SignalExpectedSeqId.Add(1) - 1
-		currentSignalPacket, exists := session.multiplexer.SignalUnordered[currentSequenceId]
+		session.multiplexer.ProtocolCompletion.ClientHelloReceived = true
+	} else if signalpacket.MessageType == shared.MessageTypeReady {
+		log.Print("received key confirmation message")
+
+		if !(session.multiplexer.ProtocolCompletion.ClientHelloReceived && session.multiplexer.ProtocolCompletion.EncryptionEstablished) {
+			log.Print("cannot confirm key without client hello and encryption establishment")
+			return shared.PacketProcessingDisconnect
+		}
+
+		transcriptHash := sha256.Sum256(session.multiplexer.HandshakeTranscript)
+		prk, err := hkdf.Extract(sha256.New, session.multiplexer.SharedSecret, transcriptHash[:])
+		if err != nil {
+			log.Print("error: hkdf failed to extract: ", err)
+		}
+
+		confirmKey, err := hkdf.Expand(sha256.New, prk, "confirm", 32)
+		if err != nil {
+			log.Print("error: hkdf failed to expand: ", err)
+		}
+
+		// my message
+		mac := hmac.New(sha256.New, confirmKey)
+		mac.Write(session.multiplexer.HandshakeTranscript)
+		mac.Write([]byte("server"))
+
+		macSum := mac.Sum(nil)
+
+		// confirm client message
+		macClient := hmac.New(sha256.New, confirmKey)
+		macClient.Write(session.multiplexer.HandshakeTranscript)
+		macClient.Write([]byte("client"))
+
+		macClientSum := macClient.Sum(nil)
+
+		if !hmac.Equal(macClientSum, signalpacket.Payload) {
+			log.Print("error: key confirmation do not match, ending handshake")
+			return shared.PacketProcessingDisconnect
+		} else {
+			log.Print("key confirmation matches")
+		}
+
+		// send back the confirmation
+		// 6 -- final message
+
+		session.multiplexer.SendSignal(shared.MessageTypeReady, macSum)
+
+		log.Print("wrote server Mac, handshake complete")
+
+		session.multiplexer.ProtocolCompletion.KeyConfirmed = true
+
+		handshakeCompletion := session.multiplexer.ProtocolCompletion
+
+		if !(handshakeCompletion.KeyConfirmed && handshakeCompletion.ClientHelloReceived) {
+			log.Print("error: protocol handshake failed: one or more steps skipped")
+			return shared.PacketProcessingDisconnect
+		} else {
+			log.Print("protocol established")
+		}
+
+		session.multiplexer.Ready.Store(true)
+
+	} else if signalpacket.MessageType == shared.MessageTypeAcknowledged {
+		session.multiplexer.UnacknowledgedPacketMu.Lock()
+		defer session.multiplexer.UnacknowledgedPacketMu.Unlock()
+
+		seqIdBuf := signalpacket.Payload[:4]
+		seqIdInt := binary.BigEndian.Uint32(seqIdBuf)
+
+		_, exists := session.multiplexer.UnacknowledgedPackets[seqIdInt]
 		if !exists {
-			log.Print("end of reorder chunk")
-			return
+			log.Print("failed to remove from unacknowledged packet: seq id does not exist: ", seqIdInt)
+			return shared.PacketProcessingSkipped
 		}
 
-		result := processFunc(currentSignalPacket)
-		if result == shared.PacketProcessingDisconnect {
-			log.Print("disconnecting connection, as requested by signal processor")
-			session.multiplexer.Disconnect()
-		}
-		delete(session.multiplexer.SignalUnordered, currentSequenceId)
+		delete(session.multiplexer.UnacknowledgedPackets, seqIdInt)
+		log.Print("removed seq id from unacknowledged packets:", seqIdInt)
+	} else {
+		log.Print("error: unrecognized message type: ", signalpacket.MessageType)
+		return shared.PacketProcessingSkipped
 	}
+	return shared.PacketProcessingOK
 
 }
-
 func (session *Session) HandleWebsocketLoop(conn *shared.WSStream) {
 
 	log.Print("detected new websocket")
@@ -339,13 +312,21 @@ func (session *Session) HandleWebsocketLoop(conn *shared.WSStream) {
 	defer func() {
 		conn.SetReady(false)
 	}()
-	publicKey, privateKey, err := kyber768.GenerateKeyPair(rand.Reader)
-	session.multiplexer.PublicKey = publicKey
-	session.multiplexer.PrivateKey = privateKey
-	if err != nil {
-		log.Print("error: failed to generate keypair", err)
-		return
+	if !session.multiplexer.IsDoingHandshake.Load() {
+		publicKey, privateKey, err := kyber768.GenerateKeyPair(rand.Reader)
+		session.multiplexer.PublicKey = publicKey
+		session.multiplexer.PrivateKey = privateKey
+		if err != nil {
+			log.Print("error: failed to generate keypair", err)
+			return
+		}
+
+		session.multiplexer.IsDoingHandshake.Store(true)
+	} else {
+		log.Print("not generating new key, already doing handshake")
 	}
+
+	session.multiplexer.SetActive(conn)
 
 	//server.WebsocketWriteMessage(conn, []byte{1}) // send READY status immediately
 
@@ -362,14 +343,17 @@ func (session *Session) HandleWebsocketLoop(conn *shared.WSStream) {
 		}
 
 		decodedPacket := session.multiplexer.DecodePacket(decryptedMessage)
-		session.multiplexer.SendAcknowledged(decodedPacket.SequenceId)
+		// do not acknowledge the ACK
+		if decodedPacket.MessageType != shared.MessageTypeAcknowledged {
+			session.multiplexer.SendAcknowledged(decodedPacket.SequenceId)
+		}
 
 		session.lastActiveTime = time.Now()
 
 		if decodedPacket.MessageType == shared.MessageTypeNetwork {
 
 			// is a network packet
-			if (!conn.GetReady()) {
+			if !session.multiplexer.Ready.Load() {
 				log.Print("warn: ignored packet received during handshake")
 				continue
 			}
@@ -409,7 +393,7 @@ func (session *Session) HandleWebsocketLoop(conn *shared.WSStream) {
 				log.Print("connection dialed successfully")
 
 				tcpConnObj := shared.NewTCPStream(tcpConn)
-				
+
 				go session.HandleTCPConnection(tcpConnObj, conn, int(clientID))
 				//log.Print("writing ", messagePayload)
 				//tcpConn.Write(messagePayload)
@@ -428,14 +412,12 @@ func (session *Session) HandleWebsocketLoop(conn *shared.WSStream) {
 
 					// add seq id
 
-				
 					// log.Print("Send Websocket round robin and encrypting (initial established): ", base64.StdEncoding.EncodeToString(msgEstablished))
 					// log.Printf("Sent message sum: %x\n", sha256.Sum256(msgEstablished))
-					
-					establishedMessageEncoded := tcpConnObj.EncodePacketPayload(clientID, msgEstablished)
-					session.multiplexer.SendData(shared.MessageTypeNetwork, establishedMessageEncoded)		
 
-					
+					establishedMessageEncoded := tcpConnObj.EncodePacketPayload(clientID, msgEstablished)
+					session.multiplexer.SendData(shared.MessageTypeNetwork, establishedMessageEncoded)
+
 				} else {
 
 					// forward original handshake
@@ -452,21 +434,28 @@ func (session *Session) HandleWebsocketLoop(conn *shared.WSStream) {
 
 				// rate limiting
 				session.limiterWait(session.outboundLimiter, len(messagePayload))
-				
+
 				seqId, packetPayload := tcpConn.DecodePacketPayload(messagePayload)
 				tcpConn.OnPacketReceived(packetPayload, seqId)
 
 			}
-		} else if decodedPacket.MessageType == shared.MessageTypeReady              { session.ReorderSignalPackets(decodedPacket, session.ProcessSignalPacket) 
-		} else if decodedPacket.MessageType == shared.MessageTypeAcknowledged       { session.ReorderSignalPackets(decodedPacket, session.ProcessSignalPacket) 
-		} else if decodedPacket.MessageType == shared.MessageTypeClientHello        { session.ReorderSignalPackets(decodedPacket, session.ProcessSignalPacket)
-		} else if decodedPacket.MessageType == shared.MessageTypeHandshake          { session.ReorderSignalPackets(decodedPacket, session.ProcessSignalPacket)
-		} else if decodedPacket.MessageType == shared.MessageTypeTCPAcknowledged    { session.ReorderSignalPackets(decodedPacket, session.ProcessSignalPacket)
-		} else if decodedPacket.MessageType == shared.MessageTypeSignalAcknowledged { session.ReorderSignalPackets(decodedPacket, session.ProcessSignalPacket)
-		} else if decodedPacket.MessageType == shared.MessageTypeSignature          { session.ReorderSignalPackets(decodedPacket, session.ProcessSignalPacket)
-		} else if decodedPacket.MessageType == shared.MessageTypeAcknowledged       { session.ReorderSignalPackets(decodedPacket, session.ProcessSignalPacket)
+		} else if decodedPacket.MessageType == shared.MessageTypeReady {
+			session.multiplexer.ReorderSignalPackets(decodedPacket, session.ProcessSignalPacket)
+		} else if decodedPacket.MessageType == shared.MessageTypeAcknowledged {
+			session.multiplexer.ReorderSignalPackets(decodedPacket, session.ProcessSignalPacket)
+		} else if decodedPacket.MessageType == shared.MessageTypeClientHello {
+			session.multiplexer.ReorderSignalPackets(decodedPacket, session.ProcessSignalPacket)
+		} else if decodedPacket.MessageType == shared.MessageTypeHandshake {
+			session.multiplexer.ReorderSignalPackets(decodedPacket, session.ProcessSignalPacket)
+		} else if decodedPacket.MessageType == shared.MessageTypeTCPAcknowledged {
+			session.multiplexer.ReorderSignalPackets(decodedPacket, session.ProcessSignalPacket)
+		} else if decodedPacket.MessageType == shared.MessageTypeSignalAcknowledged {
+			session.multiplexer.ReorderSignalPackets(decodedPacket, session.ProcessSignalPacket)
+		} else if decodedPacket.MessageType == shared.MessageTypeSignature {
+			session.multiplexer.ReorderSignalPackets(decodedPacket, session.ProcessSignalPacket)
+		} else if decodedPacket.MessageType == shared.MessageTypeAcknowledged {
+			session.multiplexer.ReorderSignalPackets(decodedPacket, session.ProcessSignalPacket)
 		}
-
 
 	}
 }
@@ -605,7 +594,6 @@ func (server *Server) HandleWebsocketRequest(w http.ResponseWriter, r *http.Requ
 	numberOfStreams := len(session.multiplexer.Streams)
 	session.multiplexer.StreamsMu.RUnlock()
 
-
 	if numberOfStreams >= 8 {
 		log.Print("reached maximum number of wss connections per session")
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -618,7 +606,6 @@ func (server *Server) HandleWebsocketRequest(w http.ResponseWriter, r *http.Requ
 		log.Print("error: failed to upgrade connection: ", err)
 		return
 	}
-
 
 	connectionObject := session.multiplexer.NewWebsocketStream(conn)
 

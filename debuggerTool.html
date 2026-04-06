@@ -2,12 +2,12 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Protocol Stream Debugger (Size Masking)</title>
+    <title>Multiplexer Debug Suite</title>
     <style>
         :root {
             --bg: #f8f9fa;
             --card-bg: #ffffff;
-            --header-bg: rgba(255, 255, 255, 0.95);
+            --header-bg: #fff;
             --border: #dee2e6;
             --text-main: #212529;
             --text-muted: #6c757d;
@@ -16,91 +16,125 @@
             --accent-data: #052c65;
             --accent-sig: #6f42c1;
             --accent-ack: #adb5bd;
-            --code-bg: #f1f3f5;
-            
-            /* Highlighting Colors */
-            --hl-envelope: #e7f1ff; 
-            --hl-envelope-border: #cfe2ff;
-            --hl-sequencer: #fff0f0; 
-            --hl-sequencer-border: #ffcccc;
-            --hl-overflow: #f1f3f5; /* Grayed out color */
+            --accent-byte-fifth: #198754;
+            --hl-envelope: #e7f1ff;
+            --hl-sequencer: #fff0f0;
+            --hl-overflow: #f1f3f5;
         }
 
-        body { 
+        body {
             font-family: -apple-system, system-ui, sans-serif;
-            background: var(--bg); 
-            color: var(--text-main); 
-            margin: 0; 
-            font-size: 18px; 
+            background: var(--bg);
+            color: var(--text-main);
+            margin: 0;
+            font-size: 16px;
         }
 
-        .header-bar {
-            position: sticky; top: 0;
+        /* Navigation Tabs */
+        .top-nav {
             background: var(--header-bg);
             border-bottom: 1px solid var(--border);
-            padding: 15px 30px;
-            z-index: 100;
-            display: flex; justify-content: space-between; align-items: center;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.03);
+            position: sticky;
+            top: 0;
+            z-index: 1000;
+            padding: 0 30px;
+            display: flex;
+            align-items: center;
+            gap: 40px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.05);
         }
+        .nav-tabs { display: flex; gap: 5px; margin-top: 15px; }
+        .tab-btn {
+            padding: 12px 25px;
+            border: none;
+            background: none;
+            cursor: pointer;
+            font-weight: 600;
+            color: var(--text-muted);
+            border-bottom: 3px solid transparent;
+            transition: all 0.2s;
+            font-size: 0.9rem;
+        }
+        .tab-btn.active { color: var(--accent-send); border-bottom-color: var(--accent-send); }
+        .tab-btn:hover { background: #f1f3f5; }
 
         .container { max-width: 1400px; margin: 25px auto; padding: 0 20px; }
+        .view-content { display: none; }
+        .view-content.active { display: block; }
 
-        .packet { 
-            background: var(--card-bg); 
-            border: 1px solid var(--border); 
-            border-radius: 8px; 
-            margin-bottom: 10px; 
-            overflow: hidden; 
+        /* Uploader Styling */
+        .upload-zone {
+            background: #fff;
+            border: 2px dashed #ccc;
+            padding: 20px;
+            text-align: center;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            transition: border-color 0.3s;
         }
-        .packet:hover { border-color: #adb5bd; }
+        .upload-zone:hover { border-color: var(--accent-send); }
 
+        /* STREAM INSPECTOR STYLES */
+        .packet {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            margin-bottom: 10px;
+            overflow: hidden;
+            content-visibility: auto;
+            contain-intrinsic-size: 220px;
+            contain: layout paint style;
+        }
         .packet.is-ack { opacity: 0.8; border-left: 4px solid var(--accent-ack); }
-        .packet.is-ack .packet-header { padding: 8px 20px; font-size: 0.9rem; background: #fdfdfd; }
-
-        .packet-header { 
-            padding: 15px 20px; 
-            cursor: pointer; 
-            display: flex; gap: 20px; align-items: center; 
+        .packet-header {
+            padding: 12px 20px;
+            cursor: pointer;
+            display: flex;
+            gap: 20px;
+            align-items: center;
         }
-
-        .packet.is-data { border-left: 4px solid var(--accent-data); }
-        .packet.is-sig { border-left: 4px solid var(--accent-sig); }
-
-        .dir { font-weight: 800; width: 60px; }
+        .packet-body { padding: 25px; background: #fff; border-top: 1px solid var(--border); }
+        .dir { font-weight: 800; width: 100px; }
         .dir-send { color: var(--accent-send); }
         .dir-recv { color: var(--accent-recv); }
         .dir-ack { color: var(--accent-ack); }
-
-        .tag { 
-            padding: 2px 10px; border-radius: 4px; font-size: 0.75em; 
-            background: #e9ecef; font-weight: 600; font-family: monospace; 
+        .tag {
+            padding: 2px 10px;
+            border-radius: 4px;
+            font-size: 0.75em;
+            background: #e9ecef;
+            font-weight: 600;
+            font-family: monospace;
         }
-
-        .packet-body { padding: 25px; background: #fff; border-top: 1px solid var(--border); }
-
         .grid-info {
-            display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); 
-            gap: 15px; margin-bottom: 25px;
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
         }
-
-        .field { 
-            background: #f8f9fa; padding: 12px; border-radius: 6px; border: 1px solid #eee;
+        .field {
+            background: #f8f9fa;
+            padding: 10px;
+            border-radius: 6px;
+            border: 1px solid #eee;
         }
-        .field label { display: block; color: var(--text-muted); font-size: 0.7rem; font-weight: 800; text-transform: uppercase; }
-        .field span { font-family: monospace; font-size: 1.1rem; }
-
+        .field label {
+            display: block;
+            color: var(--text-muted);
+            font-size: 0.65rem;
+            font-weight: 800;
+            text-transform: uppercase;
+        }
+        .field span { font-family: monospace; font-size: 1rem; }
         .byte-grid {
             display: flex;
             flex-wrap: wrap;
             gap: 4px;
-            background: var(--code-bg);
+            background: #f1f3f5;
             padding: 12px;
             border-radius: 6px;
-            border: 1px solid #dee2e6;
-            font-family: 'Cascadia Code', 'Consolas', monospace;
+            font-family: monospace;
         }
-
         .byte-unit {
             width: 38px;
             height: 30px;
@@ -111,83 +145,143 @@
             border: 1px solid #dee2e6;
             border-radius: 3px;
             font-size: 0.85rem;
-            color: #495057;
         }
+        .byte-unit.header-byte { background: var(--hl-envelope); font-weight: bold; }
+        .byte-unit.seq-byte { background: var(--hl-sequencer); font-weight: bold; color: #b02a37; }
+        .byte-unit.overflow-byte { background: var(--hl-overflow); color: #adb5bd; opacity: 0.5; }
+        .byte-unit.fifth-byte { background: var(--accent-byte-fifth); color: #fff; font-weight: 700; }
 
-        .byte-unit.header-byte { background: var(--hl-envelope); border-color: var(--hl-envelope-border); font-weight: bold; }
-        .byte-unit.seq-byte { background: var(--hl-sequencer); border-color: var(--hl-sequencer-border); font-weight: bold; color: #b02a37; }
-        
-        /* Gray out for overflow bytes */
-        .byte-unit.overflow-byte { background: var(--hl-overflow); border-color: #e9ecef; color: #adb5bd; opacity: 0.6; }
-
-        .section-label { 
-            font-size: 0.75rem; font-weight: 800; color: var(--text-muted); 
-            margin: 20px 0 8px 0; display: block; text-transform: uppercase; 
+        /* TEXT LOG STYLES */
+        .log-table {
+            width: 100%;
+            border-collapse: collapse;
+            background: #fff;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
         }
+        .log-row {
+            border-bottom: 1px solid #eee;
+            font-family: 'Cascadia Code', 'Consolas', monospace;
+            font-size: 0.85rem;
+            content-visibility: auto;
+            contain-intrinsic-size: 40px;
+            contain: layout paint style;
+        }
+        .log-row:hover { background: #f8f9fa; }
+        .log-cell { padding: 10px 15px; vertical-align: top; }
+        .log-time { color: #888; white-space: nowrap; width: 160px; }
+        .log-source { color: var(--accent-sig); font-weight: bold; width: 220px; border-right: 1px solid #f0f0f0; }
+        .log-msg { color: #333; padding-left: 20px; }
+        .log-msg b { color: var(--accent-send); }
+        .log-highlight-ack { background: #e7f5ea; color: #1e7e34; padding: 2px 4px; border-radius: 3px; font-weight: bold; }
+        .log-highlight-num { color: #d63384; font-weight: bold; }
 
         .hidden { display: none; }
-        .ack-preview { color: var(--text-muted); font-size: 0.85em; margin-left: auto; }
-        
-        .legend { display: flex; gap: 20px; font-size: 0.7rem; margin-top: 10px; flex-wrap: wrap; }
-        .legend-item { display: flex; align-items: center; gap: 5px; text-transform: uppercase; font-weight: bold; color: #666; }
-        .dot { width: 10px; height: 10px; border-radius: 2px; }
+        h2 { margin: 0; font-size: 1.4rem; padding: 20px 0; }
     </style>
 </head>
 <body>
 
-<div class="header-bar">
-    <div style="display:flex; align-items:center; gap: 20px;">
-        <h2 style="margin:0;">📡 StreamView</h2>
-        <input type="file" id="fileInput" accept=".log,.txt">
+<nav class="top-nav">
+    <h2>📡 Multiplexer Suite</h2>
+    <div class="nav-tabs">
+        <button class="tab-btn active" data-tab="stream-view">Stream Inspector</button>
+        <button class="tab-btn" data-tab="log-view">Application Logs</button>
     </div>
-    <div id="stats" style="color:var(--text-muted); font-size: 0.9rem;">Ready</div>
+</nav>
+
+<div class="container">
+    <div id="stream-view" class="view-content active">
+        <div class="upload-zone">
+            <p>Upload <b>debugStream.log</b> (Raw Byte Packets)</p>
+            <input type="file" id="streamInput" accept=".log,.txt">
+        </div>
+        <div id="streamOutput"></div>
+    </div>
+
+    <div id="log-view" class="view-content">
+        <div class="upload-zone">
+            <p>Upload <b>standard.log</b> (Text-based Go Logs)</p>
+            <input type="file" id="textLogInput" accept=".log,.txt">
+        </div>
+        <table class="log-table">
+            <tbody id="textLogOutput"></tbody>
+        </table>
+    </div>
 </div>
 
-<div class="container" id="output"></div>
-
 <script>
-    document.getElementById('fileInput').addEventListener('change', function(e) {
-        const file = e.target.files[0];
-        if (!file) return;
-        const reader = new FileReader();
-        reader.onload = (e) => parseLog(e.target.result);
-        reader.readAsText(file);
+    const streamInput = document.getElementById('streamInput');
+    const textLogInput = document.getElementById('textLogInput');
+    const streamOutput = document.getElementById('streamOutput');
+    const textLogOutput = document.getElementById('textLogOutput');
+    const topNav = document.querySelector('.top-nav');
+
+    const STREAM_BATCH_SIZE = 100;
+    const LOG_BATCH_SIZE = 200;
+
+    function switchTab(tabId, buttonEl) {
+        document.querySelectorAll('.view-content').forEach(v => v.classList.remove('active'));
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        document.getElementById(tabId).classList.add('active');
+        if (buttonEl) buttonEl.classList.add('active');
+    }
+
+    topNav.addEventListener('click', (e) => {
+        const btn = e.target.closest('.tab-btn');
+        if (!btn) return;
+        switchTab(btn.dataset.tab, btn);
+    });
+
+    streamOutput.addEventListener('click', (e) => {
+        const header = e.target.closest('.packet-header');
+        if (!header) return;
+        const body = header.nextElementSibling;
+        if (body) body.classList.toggle('hidden');
     });
 
     function toUint32(bytes) {
         if (!bytes || bytes.length < 4) return 0;
-        return (bytes[0] << 24 | bytes[1] << 16 | bytes[2] << 8 | bytes[3]) >>> 0;
+        return ((bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3]) >>> 0;
     }
 
-    function parseLog(text) {
-        const output = document.getElementById('output');
-        output.innerHTML = '';
-        const lines = text.split('\n');
+    function escapeHtml(str) {
+        return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    function parseStreamLog(text) {
+        streamOutput.innerHTML = '';
+        const lines = text.split(/\r?\n/);
         const regex = /(SEND|RECV)\s+>\s+\[(.*?)\]/;
+        const packets = [];
 
-        lines.forEach((line) => {
+        for (const line of lines) {
             const match = line.match(regex);
-            if (!match) return;
+            if (!match) continue;
 
-            const direction = match[1];
-            const bytes = match[2].split(',').map(b => parseInt(b.trim()));
-            if (bytes.length < 9) return;
+            const bytes = match[2].split(',').map(b => parseInt(b.trim(), 10));
+            if (bytes.length < 9 || bytes.some(Number.isNaN)) continue;
 
             const mxSeqId = toUint32(bytes.slice(0, 4));
             const typ = bytes[4];
             const msgSize = toUint32(bytes.slice(5, 9));
 
-            let internal = { type: typ, dir: direction, bytes: bytes };
+            const internal = { type: typ, dir: match[1], bytes };
 
             if (typ === 0) {
                 internal.style = 'is-data';
-                internal.typeLabel = "DATA";
+                internal.typeLabel = 'DATA';
                 internal.sid = bytes[9];
                 internal.tcpSeqId = toUint32(bytes.slice(10, 14));
             } else if (typ === 9) {
                 internal.style = 'is-ack';
-                internal.typeLabel = "ACK";
-                internal.sigSeqId = toUint32(bytes.slice(9, 13));
+                internal.typeLabel = 'ACK';
                 internal.ackTarget = toUint32(bytes.slice(13, 17));
             } else {
                 internal.style = 'is-sig';
@@ -195,84 +289,152 @@
                 internal.sigSeqId = toUint32(bytes.slice(9, 13));
             }
 
-            renderPacket(mxSeqId, typ, msgSize, internal);
-        });
+            packets.push({ mxSeqId, typ, msgSize, internal });
+        }
+
+        renderStreamPacketsBatched(packets);
     }
 
-    function renderPacket(mxid, typ, size, internal) {
-        const container = document.getElementById('output');
-        const div = document.createElement('div');
-        const isAck = typ === 9;
-        const isData = typ === 0;
-        div.className = `packet ${internal.style}`;
-        
-        const displayDir = isAck ? 'ACK' : internal.dir;
-        const dirClass = isAck ? 'dir-ack' : (internal.dir === 'SEND' ? 'dir-send' : 'dir-recv');
+    function renderStreamPacketsBatched(packets) {
+        let index = 0;
 
-        // Logic for byte highlighting:
-        // Envelope: 0-8
-        // Sequencer: 9-12 (Sig) or 9-13 (Data)
-        // Message limit: Header (9) + msgSize
+        function appendChunk() {
+            const frag = document.createDocumentFragment();
+            const end = Math.min(index + STREAM_BATCH_SIZE, packets.length);
+
+            for (; index < end; index++) {
+                frag.appendChild(buildPacketElement(packets[index]));
+            }
+
+            streamOutput.appendChild(frag);
+
+            if (index < packets.length) {
+                requestAnimationFrame(appendChunk);
+            }
+        }
+
+        requestAnimationFrame(appendChunk);
+    }
+
+    function buildPacketElement(packet) {
+        const { mxSeqId: mxid, typ, msgSize: size, internal } = packet;
+        const isAck = typ === 9;
         const totalMessageBytes = 9 + size;
+        const ackLabel = internal.dir === 'SEND' ? 'SEND ACK' : 'RECV ACK';
 
         const byteGridHtml = internal.bytes.map((b, i) => {
             let className = 'byte-unit';
-            
-            // First check if it exceeds the message size
-            if (i >= totalMessageBytes) {
-                className += ' overflow-byte';
-            } else if (i < 9) {
-                className += ' header-byte';
-            } else if (isData) {
-                if (i >= 9 && i <= 13) className += ' seq-byte';
-            } else {
-                if (i >= 9 && i <= 12) className += ' seq-byte';
-            }
-            
+            if (i === 4) className += ' fifth-byte';
+            if (i >= totalMessageBytes) className += ' overflow-byte';
+            else if (i < 9) className += ' header-byte';
+            else if (internal.type === 0 && i >= 9 && i <= 13) className += ' seq-byte';
+            else if (internal.type !== 0 && i >= 9 && i <= 12) className += ' seq-byte';
             return `<div class="${className}">${b}</div>`;
         }).join('');
 
+        const div = document.createElement('div');
+        div.className = `packet ${internal.style || ''}`;
+
         div.innerHTML = `
             <div class="packet-header">
-                <span class="dir ${dirClass}">${displayDir}</span>
+                <span class="dir ${isAck ? 'dir-ack' : 'dir-' + internal.dir.toLowerCase()}">${isAck ? ackLabel : internal.dir}</span>
                 <span class="tag">MXID ${mxid}</span>
-                ${isAck ? `<span class="ack-preview">Confirmed MXID ${internal.ackTarget}</span>` : `<span class="tag">${internal.typeLabel}</span>`}
-                <span style="color: var(--text-muted); font-size: 0.7em; margin-left: auto;">${size} BYTES</span>
+                ${isAck
+                    ? `<span style="color:#888;font-size:0.85em;margin-left:auto">Confirmed MXID ${internal.ackTarget}</span>`
+                    : `<span class="tag">${internal.typeLabel}</span>`
+                }
+                <span style="color:var(--text-muted);font-size:0.75em;${isAck ? '' : 'margin-left:auto'}">${size} B</span>
             </div>
             <div class="packet-body hidden">
                 <div class="grid-info">
                     <div class="field"><label>MX Seq ID</label><span>${mxid}</span></div>
-                    <div class="field"><label>MSG SIZE</label><span>${size}</span></div>
+                    <div class="field"><label>Msg Size</label><span>${size}</span></div>
                     <div class="field"><label>Type</label><span>${typ}</span></div>
-                    ${isData ? `
-                        <div class="field"><label>Stream ID</label><span>${internal.sid}</span></div>
+                    ${internal.type === 0 ? `
+                        <div class="field"><label>SID</label><span>${internal.sid}</span></div>
                         <div class="field"><label>TCP Seq ID</label><span>${internal.tcpSeqId}</span></div>
-                    ` : `<div class="field"><label>Sig Seq ID</label><span>${internal.sigSeqId || '0'}</span></div>`}
+                    ` : `<div class="field"><label>Sig Seq ID</label><span>${internal.sigSeqId || 0}</span></div>`}
                 </div>
-
-                <span class="section-label">Byte Alignment Map</span>
                 <div class="byte-grid">${byteGridHtml}</div>
-                
-                <div class="legend">
-                    <div class="legend-item"><div class="dot" style="background:var(--hl-envelope)"></div> Envelope (MX)</div>
-                    <div class="legend-item"><div class="dot" style="background:var(--hl-sequencer)"></div> Control Header</div>
-                    <div class="legend-item"><div class="dot" style="background:#fff; border: 1px solid #dee2e6"></div> Payload</div>
-                    <div class="legend-item"><div class="dot" style="background:var(--hl-overflow)"></div> Log Overflow (> MsgSize)</div>
-                </div>
+            </div>`;
 
-                <span class="section-label">Hex View</span>
-                <div class="byte-grid" style="background:#fff">
-                    ${internal.bytes.map((b, i) => {
-                        const style = i >= totalMessageBytes ? 'opacity: 0.3; background: #eee;' : 'background: #f1f3f5;';
-                        return `<div class="byte-unit" style="${style}">${b.toString(16).padStart(2,'0').toUpperCase()}</div>`
-                    }).join('')}
-                </div>
-            </div>
-        `;
-
-        div.querySelector('.packet-header').onclick = () => div.querySelector('.packet-body').classList.toggle('hidden');
-        container.appendChild(div);
+        return div;
     }
+
+    function parseTextLog(text) {
+        textLogOutput.innerHTML = '';
+        const lines = text.split(/\r?\n/);
+        const logRegex = /^(\d{4}\/\d{2}\/\d{2}\s\d{2}:\d{2}:\d{2})\s+([\w\.]+:\d+):\s+(.*)$/;
+        const rows = [];
+
+        for (const line of lines) {
+            if (!line.trim()) continue;
+            const match = line.match(logRegex);
+            if (match) rows.push(match);
+            else rows.push(null);
+        }
+
+        renderTextLogsBatched(rows);
+    }
+
+    function renderTextLogsBatched(rows) {
+        let index = 0;
+
+        function appendChunk() {
+            const frag = document.createDocumentFragment();
+            const end = Math.min(index + LOG_BATCH_SIZE, rows.length);
+
+            for (; index < end; index++) {
+                const match = rows[index];
+                const row = document.createElement('tr');
+                row.className = 'log-row';
+
+                if (match) {
+                    const time = match[1];
+                    const source = match[2];
+                    let msg = escapeHtml(match[3]);
+
+                    msg = msg.replace(/\bACK\b/g, '<span class="log-highlight-ack">ACK</span>');
+                    msg = msg.replace(/(\d+)/g, '<span class="log-highlight-num">$1</span>');
+
+                    row.innerHTML = `
+                        <td class="log-cell log-time">${time}</td>
+                        <td class="log-cell log-source">${source}</td>
+                        <td class="log-cell log-msg">${msg}</td>
+                    `;
+                } else {
+                    row.innerHTML = `<td colspan="3" class="log-cell" style="color:#aaa italic"></td>`;
+                }
+
+                frag.appendChild(row);
+            }
+
+            textLogOutput.appendChild(frag);
+
+            if (index < rows.length) {
+                requestAnimationFrame(appendChunk);
+            }
+        }
+
+        requestAnimationFrame(appendChunk);
+    }
+
+    streamInput.addEventListener('change', function(e) {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (e) => parseStreamLog(e.target.result);
+        reader.readAsText(file);
+    });
+
+    textLogInput.addEventListener('change', function(e) {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (e) => parseTextLog(e.target.result);
+        reader.readAsText(file);
+    });
 </script>
+
 </body>
 </html>

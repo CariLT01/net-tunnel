@@ -279,6 +279,12 @@ func (multiplexer *WebsocketMultiplexer) SendSignalOnWebsocket(wsStream *WSStrea
 	currentDataSeqId := multiplexer.MultiplexerSequenceID.Add(1) - 1
 	log.Print("in signal on wss, incremented mx seq id by 1 to: ", currentDataSeqId)
 	encodedPayload := multiplexer.EncodePayload(encodedPacket, currentDataSeqId)
+	multiplexer.UnacknowledgedPacketMu.Lock()
+	multiplexer.UnacknowledgedPackets[currentDataSeqId] = &UnacknowledgedPacket{
+		WebsocketIndex: wsStream.Index,
+		Payload:        encodedPayload,
+	}
+	multiplexer.UnacknowledgedPacketMu.Unlock()
 	return wsStream.WriteData(encodedPayload)
 
 }

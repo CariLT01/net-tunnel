@@ -12,6 +12,6 @@ const (
 	MessageTypeTCPAcknowledged    MessageType = 0x07 // TCP packet is acknowledged
 	MessageTypeSignalAcknowledged MessageType = 0x08 // Signal packet is acknowledged
 	MessageTypeAcknowledged       MessageType = 0x09 // Packet is acknowledged
-	MessageTypePing               MessageType = 0x10 // Latency check PING
-	MessageTypePong               MessageType = 0x11 // Latency check PONG
+	MessageTypePing               MessageType = 0x0A // Latency check PING
+	MessageTypePong               MessageType = 0x0B // Latency check PONG
 )

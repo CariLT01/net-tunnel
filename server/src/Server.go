@@ -155,7 +155,7 @@ func (session *Session) limiterWait(limiter *rate.Limiter, n int) error {
 	return nil
 }
 
-func (session *Session) ProcessSignalPacket(signalpacket *shared.SignalDecodedPacket) shared.PacketProcessingResult {
+func (session *Session) ProcessSignalPacket(signalpacket *shared.SignalDecodedPacket, conn *shared.WSStream) shared.PacketProcessingResult {
 	if signalpacket.MessageType == shared.MessageTypeHandshake {
 
 		if !session.multiplexer.ProtocolCompletion.ClientHelloReceived {
@@ -302,6 +302,16 @@ func (session *Session) ProcessSignalPacket(signalpacket *shared.SignalDecodedPa
 
 		delete(session.multiplexer.UnacknowledgedPackets, seqIdInt)
 		log.Print("removed seq id from unacknowledged packets:", seqIdInt)
+	} else if signalpacket.MessageType == shared.MessageTypePing {
+		// respond with PONG
+
+		err := session.multiplexer.SendSignalOnWebsocket(conn, shared.MessageTypePong, []byte{})
+		if err != nil {
+			log.Print("error: failed to respond with PONG: ", err)
+			return shared.PacketProcessingSkipped
+		} else {
+			log.Print("sent PONG back to websocket: ", conn.Index)
+		}
 	} else {
 		log.Print("error: unrecognized message type: ", signalpacket.MessageType)
 		return shared.PacketProcessingSkipped
@@ -456,21 +466,21 @@ func (session *Session) HandleWebsocketLoop(conn *shared.WSStream) {
 
 			}
 		} else if decodedPacket.MessageType == shared.MessageTypeReady {
-			session.multiplexer.ReorderSignalPackets(decodedPacket, session.ProcessSignalPacket)
+			session.multiplexer.ReorderSignalPackets(conn, decodedPacket, session.ProcessSignalPacket)
 		} else if decodedPacket.MessageType == shared.MessageTypeAcknowledged {
-			session.multiplexer.ReorderSignalPackets(decodedPacket, session.ProcessSignalPacket)
+			session.multiplexer.ReorderSignalPackets(conn, decodedPacket, session.ProcessSignalPacket)
 		} else if decodedPacket.MessageType == shared.MessageTypeClientHello {
-			session.multiplexer.ReorderSignalPackets(decodedPacket, session.ProcessSignalPacket)
+			session.multiplexer.ReorderSignalPackets(conn, decodedPacket, session.ProcessSignalPacket)
 		} else if decodedPacket.MessageType == shared.MessageTypeHandshake {
-			session.multiplexer.ReorderSignalPackets(decodedPacket, session.ProcessSignalPacket)
+			session.multiplexer.ReorderSignalPackets(conn, decodedPacket, session.ProcessSignalPacket)
 		} else if decodedPacket.MessageType == shared.MessageTypeTCPAcknowledged {
-			session.multiplexer.ReorderSignalPackets(decodedPacket, session.ProcessSignalPacket)
+			session.multiplexer.ReorderSignalPackets(conn, decodedPacket, session.ProcessSignalPacket)
 		} else if decodedPacket.MessageType == shared.MessageTypeSignalAcknowledged {
-			session.multiplexer.ReorderSignalPackets(decodedPacket, session.ProcessSignalPacket)
+			session.multiplexer.ReorderSignalPackets(conn, decodedPacket, session.ProcessSignalPacket)
 		} else if decodedPacket.MessageType == shared.MessageTypeSignature {
-			session.multiplexer.ReorderSignalPackets(decodedPacket, session.ProcessSignalPacket)
-		} else if decodedPacket.MessageType == shared.MessageTypeAcknowledged {
-			session.multiplexer.ReorderSignalPackets(decodedPacket, session.ProcessSignalPacket)
+			session.multiplexer.ReorderSignalPackets(conn, decodedPacket, session.ProcessSignalPacket)
+		} else if decodedPacket.MessageType == shared.MessageTypePing {
+			session.multiplexer.ReorderSignalPackets(conn, decodedPacket, session.ProcessSignalPacket)
 		}
 
 	}

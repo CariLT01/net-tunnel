@@ -4,6 +4,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/cloudflare/circl/kem"
 	"github.com/gorilla/websocket"
@@ -32,7 +33,9 @@ type WSStream struct {
 	protocolCompletion HandshakeProtocolCompletion
 	scheme             kem.Scheme
 
-	Index uint32
+	Index           uint32
+	Latency         atomic.Uint32
+	LatencyPingTime time.Time
 }
 
 func (stream *WSStream) WriteRaw(rawData []byte) error {

@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Protocol Stream Debugger (Size Masking)</title>
+    <style>
+        :root {
+            --bg: #f8f9fa;
+            --card-bg: #ffffff;
+            --header-bg: rgba(255, 255, 255, 0.95);
+            --border: #dee2e6;
+            --text-main: #212529;
+            --text-muted: #6c757d;
+            --accent-send: #0d6efd;
+            --accent-recv: #fd7e14;
+            --accent-data: #052c65;
+            --accent-sig: #6f42c1;
+            --accent-ack: #adb5bd;
+            --code-bg: #f1f3f5;
+            
+            /* Highlighting Colors */
+            --hl-envelope: #e7f1ff; 
+            --hl-envelope-border: #cfe2ff;
+            --hl-sequencer: #fff0f0; 
+            --hl-sequencer-border: #ffcccc;
+            --hl-overflow: #f1f3f5; /* Grayed out color */
+        }
+
+        body { 
+            font-family: -apple-system, system-ui, sans-serif;
+            background: var(--bg); 
+            color: var(--text-main); 
+            margin: 0; 
+            font-size: 18px; 
+        }
+
+        .header-bar {
+            position: sticky; top: 0;
+            background: var(--header-bg);
+            border-bottom: 1px solid var(--border);
+            padding: 15px 30px;
+            z-index: 100;
+            display: flex; justify-content: space-between; align-items: center;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.03);
+        }
+
+        .container { max-width: 1400px; margin: 25px auto; padding: 0 20px; }
+
+        .packet { 
+            background: var(--card-bg); 
+            border: 1px solid var(--border); 
+            border-radius: 8px; 
+            margin-bottom: 10px; 
+            overflow: hidden; 
+        }
+        .packet:hover { border-color: #adb5bd; }
+
+        .packet.is-ack { opacity: 0.8; border-left: 4px solid var(--accent-ack); }
+        .packet.is-ack .packet-header { padding: 8px 20px; font-size: 0.9rem; background: #fdfdfd; }
+
+        .packet-header { 
+            padding: 15px 20px; 
+            cursor: pointer; 
+            display: flex; gap: 20px; align-items: center; 
+        }
+
+        .packet.is-data { border-left: 4px solid var(--accent-data); }
+        .packet.is-sig { border-left: 4px solid var(--accent-sig); }
+
+        .dir { font-weight: 800; width: 60px; }
+        .dir-send { color: var(--accent-send); }
+        .dir-recv { color: var(--accent-recv); }
+        .dir-ack { color: var(--accent-ack); }
+
+        .tag { 
+            padding: 2px 10px; border-radius: 4px; font-size: 0.75em; 
+            background: #e9ecef; font-weight: 600; font-family: monospace; 
+        }
+
+        .packet-body { padding: 25px; background: #fff; border-top: 1px solid var(--border); }
+
+        .grid-info {
+            display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); 
+            gap: 15px; margin-bottom: 25px;
+        }
+
+        .field { 
+            background: #f8f9fa; padding: 12px; border-radius: 6px; border: 1px solid #eee;
+        }
+        .field label { display: block; color: var(--text-muted); font-size: 0.7rem; font-weight: 800; text-transform: uppercase; }
+        .field span { font-family: monospace; font-size: 1.1rem; }
+
+        .byte-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            background: var(--code-bg);
+            padding: 12px;
+            border-radius: 6px;
+            border: 1px solid #dee2e6;
+            font-family: 'Cascadia Code', 'Consolas', monospace;
+        }
+
+        .byte-unit {
+            width: 38px;
+            height: 30px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #fff;
+            border: 1px solid #dee2e6;
+            border-radius: 3px;
+            font-size: 0.85rem;
+            color: #495057;
+        }
+
+        .byte-unit.header-byte { background: var(--hl-envelope); border-color: var(--hl-envelope-border); font-weight: bold; }
+        .byte-unit.seq-byte { background: var(--hl-sequencer); border-color: var(--hl-sequencer-border); font-weight: bold; color: #b02a37; }
+        
+        /* Gray out for overflow bytes */
+        .byte-unit.overflow-byte { background: var(--hl-overflow); border-color: #e9ecef; color: #adb5bd; opacity: 0.6; }
+
+        .section-label { 
+            font-size: 0.75rem; font-weight: 800; color: var(--text-muted); 
+            margin: 20px 0 8px 0; display: block; text-transform: uppercase; 
+        }
+
+        .hidden { display: none; }
+        .ack-preview { color: var(--text-muted); font-size: 0.85em; margin-left: auto; }
+        
+        .legend { display: flex; gap: 20px; font-size: 0.7rem; margin-top: 10px; flex-wrap: wrap; }
+        .legend-item { display: flex; align-items: center; gap: 5px; text-transform: uppercase; font-weight: bold; color: #666; }
+        .dot { width: 10px; height: 10px; border-radius: 2px; }
+    </style>
+</head>
+<body>
+
+<div class="header-bar">
+    <div style="display:flex; align-items:center; gap: 20px;">
+        <h2 style="margin:0;">📡 StreamView</h2>
+        <input type="file" id="fileInput" accept=".log,.txt">
+    </div>
+    <div id="stats" style="color:var(--text-muted); font-size: 0.9rem;">Ready</div>
+</div>
+
+<div class="container" id="output"></div>
+
+<script>
+    document.getElementById('fileInput').addEventListener('change', function(e) {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (e) => parseLog(e.target.result);
+        reader.readAsText(file);
+    });
+
+    function toUint32(bytes) {
+        if (!bytes || bytes.length < 4) return 0;
+        return (bytes[0] << 24 | bytes[1] << 16 | bytes[2] << 8 | bytes[3]) >>> 0;
+    }
+
+    function parseLog(text) {
+        const output = document.getElementById('output');
+        output.innerHTML = '';
+        const lines = text.split('\n');
+        const regex = /(SEND|RECV)\s+>\s+\[(.*?)\]/;
+
+        lines.forEach((line) => {
+            const match = line.match(regex);
+            if (!match) return;
+
+            const direction = match[1];
+            const bytes = match[2].split(',').map(b => parseInt(b.trim()));
+            if (bytes.length < 9) return;
+
+            const mxSeqId = toUint32(bytes.slice(0, 4));
+            const typ = bytes[4];
+            const msgSize = toUint32(bytes.slice(5, 9));
+
+            let internal = { type: typ, dir: direction, bytes: bytes };
+
+            if (typ === 0) {
+                internal.style = 'is-data';
+                internal.typeLabel = "DATA";
+                internal.sid = bytes[9];
+                internal.tcpSeqId = toUint32(bytes.slice(10, 14));
+            } else if (typ === 9) {
+                internal.style = 'is-ack';
+                internal.typeLabel = "ACK";
+                internal.sigSeqId = toUint32(bytes.slice(9, 13));
+                internal.ackTarget = toUint32(bytes.slice(13, 17));
+            } else {
+                internal.style = 'is-sig';
+                internal.typeLabel = `SIG (${typ})`;
+                internal.sigSeqId = toUint32(bytes.slice(9, 13));
+            }
+
+            renderPacket(mxSeqId, typ, msgSize, internal);
+        });
+    }
+
+    function renderPacket(mxid, typ, size, internal) {
+        const container = document.getElementById('output');
+        const div = document.createElement('div');
+        const isAck = typ === 9;
+        const isData = typ === 0;
+        div.className = `packet ${internal.style}`;
+        
+        const displayDir = isAck ? 'ACK' : internal.dir;
+        const dirClass = isAck ? 'dir-ack' : (internal.dir === 'SEND' ? 'dir-send' : 'dir-recv');
+
+        // Logic for byte highlighting:
+        // Envelope: 0-8
+        // Sequencer: 9-12 (Sig) or 9-13 (Data)
+        // Message limit: Header (9) + msgSize
+        const totalMessageBytes = 9 + size;
+
+        const byteGridHtml = internal.bytes.map((b, i) => {
+            let className = 'byte-unit';
+            
+            // First check if it exceeds the message size
+            if (i >= totalMessageBytes) {
+                className += ' overflow-byte';
+            } else if (i < 9) {
+                className += ' header-byte';
+            } else if (isData) {
+                if (i >= 9 && i <= 13) className += ' seq-byte';
+            } else {
+                if (i >= 9 && i <= 12) className += ' seq-byte';
+            }
+            
+            return `<div class="${className}">${b}</div>`;
+        }).join('');
+
+        div.innerHTML = `
+            <div class="packet-header">
+                <span class="dir ${dirClass}">${displayDir}</span>
+                <span class="tag">MXID ${mxid}</span>
+                ${isAck ? `<span class="ack-preview">Confirmed MXID ${internal.ackTarget}</span>` : `<span class="tag">${internal.typeLabel}</span>`}
+                <span style="color: var(--text-muted); font-size: 0.7em; margin-left: auto;">${size} BYTES</span>
+            </div>
+            <div class="packet-body hidden">
+                <div class="grid-info">
+                    <div class="field"><label>MX Seq ID</label><span>${mxid}</span></div>
+                    <div class="field"><label>MSG SIZE</label><span>${size}</span></div>
+                    <div class="field"><label>Type</label><span>${typ}</span></div>
+                    ${isData ? `
+                        <div class="field"><label>Stream ID</label><span>${internal.sid}</span></div>
+                        <div class="field"><label>TCP Seq ID</label><span>${internal.tcpSeqId}</span></div>
+                    ` : `<div class="field"><label>Sig Seq ID</label><span>${internal.sigSeqId || '0'}</span></div>`}
+                </div>
+
+                <span class="section-label">Byte Alignment Map</span>
+                <div class="byte-grid">${byteGridHtml}</div>
+                
+                <div class="legend">
+                    <div class="legend-item"><div class="dot" style="background:var(--hl-envelope)"></div> Envelope (MX)</div>
+                    <div class="legend-item"><div class="dot" style="background:var(--hl-sequencer)"></div> Control Header</div>
+                    <div class="legend-item"><div class="dot" style="background:#fff; border: 1px solid #dee2e6"></div> Payload</div>
+                    <div class="legend-item"><div class="dot" style="background:var(--hl-overflow)"></div> Log Overflow (> MsgSize)</div>
+                </div>
+
+                <span class="section-label">Hex View</span>
+                <div class="byte-grid" style="background:#fff">
+                    ${internal.bytes.map((b, i) => {
+                        const style = i >= totalMessageBytes ? 'opacity: 0.3; background: #eee;' : 'background: #f1f3f5;';
+                        return `<div class="byte-unit" style="${style}">${b.toString(16).padStart(2,'0').toUpperCase()}</div>`
+                    }).join('')}
+                </div>
+            </div>
+        `;
+
+        div.querySelector('.packet-header').onclick = () => div.querySelector('.packet-body').classList.toggle('hidden');
+        container.appendChild(div);
+    }
+</script>
+</body>
+</html>

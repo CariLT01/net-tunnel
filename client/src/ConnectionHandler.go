@@ -90,7 +90,7 @@ func (app *ConnectionHandler) HandleNetworkData(decodedPacket *shared.DecodedPac
 
 }
 
-func (app *ConnectionHandler) HandleWebsocketMessage(signalpacket *shared.SignalDecodedPacket) shared.PacketProcessingResult {
+func (app *ConnectionHandler) HandleWebsocketMessage(signalpacket *shared.SignalDecodedPacket, conn *shared.WSStream) shared.PacketProcessingResult {
 	if signalpacket.MessageType == shared.MessageTypeSignature { // means client ready
 
 		if !(app.multiplexer.ProtocolCompletion.KyberHandshakeReceived) {
@@ -258,6 +258,17 @@ func (app *ConnectionHandler) HandleWebsocketMessage(signalpacket *shared.Signal
 		delete(app.multiplexer.UnacknowledgedPackets, packetSeqIdInt)
 		log.Print("deleted seq id from unacknowledged packet: ", packetSeqIdInt)
 
+	} else if signalpacket.MessageType == shared.MessageTypePong {
+		// received PONG
+		// calculate latency
+
+		difference := time.Since(conn.LatencyPingTime)
+		latencyMs := uint32(difference.Milliseconds())
+
+		conn.Latency.Store(latencyMs)
+
+		log.Print("connection ", conn.Index, " has a latency of: ", latencyMs)
+
 	} else {
 		log.Print("error: unrecognized message type: ", signalpacket.MessageType)
 		return shared.PacketProcessingSkipped
@@ -326,21 +337,21 @@ func (app *ConnectionHandler) HandleWebsocketRead(conn *shared.WSStream) {
 		if decodedPacket.MessageType == shared.MessageTypeNetwork {
 			app.HandleNetworkData(decodedPacket)
 		} else if decodedPacket.MessageType == shared.MessageTypeReady {
-			app.multiplexer.ReorderSignalPackets(decodedPacket, app.HandleWebsocketMessage)
+			app.multiplexer.ReorderSignalPackets(conn, decodedPacket, app.HandleWebsocketMessage)
 		} else if decodedPacket.MessageType == shared.MessageTypeAcknowledged {
-			app.multiplexer.ReorderSignalPackets(decodedPacket, app.HandleWebsocketMessage)
+			app.multiplexer.ReorderSignalPackets(conn, decodedPacket, app.HandleWebsocketMessage)
 		} else if decodedPacket.MessageType == shared.MessageTypeClientHello {
-			app.multiplexer.ReorderSignalPackets(decodedPacket, app.HandleWebsocketMessage)
+			app.multiplexer.ReorderSignalPackets(conn, decodedPacket, app.HandleWebsocketMessage)
 		} else if decodedPacket.MessageType == shared.MessageTypeHandshake {
-			app.multiplexer.ReorderSignalPackets(decodedPacket, app.HandleWebsocketMessage)
+			app.multiplexer.ReorderSignalPackets(conn, decodedPacket, app.HandleWebsocketMessage)
 		} else if decodedPacket.MessageType == shared.MessageTypeTCPAcknowledged {
-			app.multiplexer.ReorderSignalPackets(decodedPacket, app.HandleWebsocketMessage)
+			app.multiplexer.ReorderSignalPackets(conn, decodedPacket, app.HandleWebsocketMessage)
 		} else if decodedPacket.MessageType == shared.MessageTypeSignalAcknowledged {
-			app.multiplexer.ReorderSignalPackets(decodedPacket, app.HandleWebsocketMessage)
+			app.multiplexer.ReorderSignalPackets(conn, decodedPacket, app.HandleWebsocketMessage)
 		} else if decodedPacket.MessageType == shared.MessageTypeSignature {
-			app.multiplexer.ReorderSignalPackets(decodedPacket, app.HandleWebsocketMessage)
-		} else if decodedPacket.MessageType == shared.MessageTypeAcknowledged {
-			app.multiplexer.ReorderSignalPackets(decodedPacket, app.HandleWebsocketMessage)
+			app.multiplexer.ReorderSignalPackets(conn, decodedPacket, app.HandleWebsocketMessage)
+		} else if decodedPacket.MessageType == shared.MessageTypePong {
+			app.multiplexer.ReorderSignalPackets(conn, decodedPacket, app.HandleWebsocketMessage)
 		}
 
 		if decodedPacket.MessageType == shared.MessageTypeReady {
@@ -438,6 +449,7 @@ func (app *ConnectionHandler) Initialize() {
 	}
 
 	go app.MultiplexingScalingLoop()
+	go app.DoLatencyCheckLoop()
 
 	app.multiplexer.Initialize()
 }
@@ -605,5 +617,34 @@ func (app *ConnectionHandler) HandleNewConnection(conn net.Conn) {
 		// log.Printf("sent message sum sha256: %x\n", sha256.Sum256(buf[:n]))
 		// log.Print("Message sent to server: ", base64.StdEncoding.EncodeToString(buf[:n]))
 
+	}
+}
+
+func (app *ConnectionHandler) doLatencyCheck() {
+	app.multiplexer.StreamsMu.RLock()
+	defer app.multiplexer.StreamsMu.RUnlock()
+
+	for _, stream := range app.multiplexer.Streams {
+
+		if !stream.GetReady() {
+			log.Print("Not sending PING, stream is not ready")
+			continue
+		}
+
+		err := app.multiplexer.SendSignalOnWebsocket(stream, shared.MessageTypePing, []byte{})
+		if err != nil {
+			log.Print("error: failed to send PING: ", err)
+			continue
+		} else {
+			log.Print("Sent ping to websocket: ", stream.Index)
+			stream.LatencyPingTime = time.Now()
+		}
+	}
+}
+
+func (app *ConnectionHandler) DoLatencyCheckLoop() {
+	ticker := time.NewTicker(1 * time.Second)
+	for range ticker.C {
+		app.doLatencyCheck()
 	}
 }

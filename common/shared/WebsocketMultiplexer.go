@@ -145,11 +145,6 @@ func (multiplexer *WebsocketMultiplexer) SendDataOnAnyWithIndex(currentCounter u
 		multiplexer.ActiveStreamIndexesMu.RUnlock()
 		return
 	}
-	targetStreamIndex := multiplexer.ActiveStreamIndexes[currentCounter%uint32(activeStreamsCount)]
-	multiplexer.ActiveStreamIndexesMu.RUnlock()
-	multiplexer.StreamsMu.RLock()
-	targetStream := multiplexer.Streams[targetStreamIndex]
-	multiplexer.StreamsMu.RUnlock()
 
 	seqIdBuf := make([]byte, 4)
 	currentDataSeqId := multiplexer.MultiplexerSequenceID.Add(1) - 1
@@ -158,10 +153,30 @@ func (multiplexer *WebsocketMultiplexer) SendDataOnAnyWithIndex(currentCounter u
 
 	encodedPayload := append(seqIdBuf, payload...)
 
+	targetStreamIndex := multiplexer.ActiveStreamIndexes[currentCounter%uint32(activeStreamsCount)]
+	multiplexer.ActiveStreamIndexesMu.RUnlock()
+	multiplexer.StreamsMu.RLock()
+	targetStream, exists := multiplexer.Streams[targetStreamIndex]
+	multiplexer.StreamsMu.RUnlock()
+
+	if !exists {
+		log.Print("error: failed to write, active stream index no longer exists")
+		log.Print("queuing to quick retry")
+		multiplexer.QuickRetryQueueMu.Lock()
+		multiplexer.QuickRetryQueue = append(multiplexer.QuickRetryQueue, &ToRetry{
+			FirstIndex:         targetStreamIndex,
+			CurrentIndex:       targetStreamIndex,
+			Data:               payload,
+			OriginalSequenceId: currentDataSeqId,
+		})
+		multiplexer.QuickRetryQueueMu.Unlock()
+		return
+	}
+
 	log.Print("write on mx seq id ", currentDataSeqId)
 	err := targetStream.WriteData(encodedPayload)
 	if err != nil {
-		log.Print("error: failed to write: queueing to quick retry queue")
+		log.Print("error: failed to write: queueing to quick retry queue: ", err)
 		multiplexer.QuickRetryQueueMu.Lock()
 		multiplexer.QuickRetryQueue = append(multiplexer.QuickRetryQueue, &ToRetry{
 			FirstIndex:         targetStreamIndex,
@@ -198,8 +213,7 @@ func (multiplexer *WebsocketMultiplexer) SendDataRawOnAny(payload []byte) {
 func (multiplexer *WebsocketMultiplexer) SendSignal(messageType MessageType, data []byte) {
 	// encode pckt
 	seqIdBuf := make([]byte, 4)
-	seqIdCurrent := multiplexer.SignalSequenceId.Load()
-	multiplexer.SignalSequenceId.Add(1)
+	seqIdCurrent := multiplexer.SignalSequenceId.Add(1) - 1
 	binary.BigEndian.PutUint32(seqIdBuf, seqIdCurrent)
 
 	payloadPacket := append(seqIdBuf, data...)
@@ -284,7 +298,7 @@ func (multiplexer *WebsocketMultiplexer) SetInactive(stream *WSStream) error {
 
 func (multiplexer *WebsocketMultiplexer) SendAcknowledged(seqId uint32) {
 	// Send acknowledged packet
-	log.Print("debug: acknowledged packet sequence #", seqId)
+	log.Print("debug: sending ACK for packet sequence ", seqId)
 
 	acknowledgedSeqIdBuf := make([]byte, 4)
 	binary.BigEndian.PutUint32(acknowledgedSeqIdBuf, seqId)
@@ -299,10 +313,18 @@ func (multiplexer *WebsocketMultiplexer) DecodePacket(decryptedData []byte) *Dec
 	messageType := decryptedData[4]
 	messageSizeBuf := decryptedData[5:9]
 	messageSizeInt := binary.BigEndian.Uint32(messageSizeBuf)
+	mpSeqId := binary.BigEndian.Uint32(messageMpSeqIdBuf)
+
+	if int(messageSizeInt) < 0 || int(messageSizeInt) > len(decryptedData)-9 {
+		log.Print("error: failed to process packet: message size out of range")
+		return &DecodedPacket{
+			MessageType: messageType,
+			Payload:     []byte{},
+			SequenceId:  mpSeqId,
+		}
+	}
 
 	messagePayload := decryptedData[9 : 9+messageSizeInt]
-
-	mpSeqId := binary.BigEndian.Uint32(messageMpSeqIdBuf)
 
 	return &DecodedPacket{
 		MessageType: messageType,
@@ -338,20 +360,22 @@ func (multiplexer *WebsocketMultiplexer) Disconnect() {
 func (multiplexer *WebsocketMultiplexer) ReorderSignalPackets(newPacket *DecodedPacket, processFunc func(signalpacket *SignalDecodedPacket) PacketProcessingResult) {
 	signalpacket := multiplexer.DecodedSignalPacket(newPacket)
 
-	if signalpacket.SignalSequenceId < multiplexer.SignalExpectedSeqId.Load() {
-		log.Print("warn: packet arrived too late. expected: ", multiplexer.SignalExpectedSeqId.Load(), " got: ", signalpacket.SignalSequenceId)
-		return
-	}
-
-	if signalpacket.SignalSequenceId > multiplexer.SignalExpectedSeqId.Load()+500 {
-		log.Print("warn: packet arrived way too early! expected: ", multiplexer.SignalExpectedSeqId.Load(), " current: ", signalpacket.SignalSequenceId)
-		return
-	}
-
 	multiplexer.SignalUnorderedMu.Lock()
 	defer multiplexer.SignalUnorderedMu.Unlock()
 
-	log.Print("added packet seq id: ", signalpacket.SequenceId)
+	expected := multiplexer.SignalExpectedSeqId.Load()
+
+	if signalpacket.SignalSequenceId < expected {
+		log.Print("warn: packet arrived too late. expected: ", expected, " got: ", signalpacket.SignalSequenceId)
+		return
+	}
+
+	if signalpacket.SignalSequenceId > expected+500 {
+		log.Print("warn: packet arrived way too early! expected: ", expected, " current: ", signalpacket.SignalSequenceId)
+		return
+	}
+
+	log.Print("added packet seq id: ", signalpacket.SignalSequenceId)
 
 	multiplexer.SignalUnordered[signalpacket.SignalSequenceId] = signalpacket
 
@@ -359,7 +383,7 @@ func (multiplexer *WebsocketMultiplexer) ReorderSignalPackets(newPacket *Decoded
 		currentSequenceId := multiplexer.SignalExpectedSeqId.Load()
 		currentSignalPacket, exists := multiplexer.SignalUnordered[currentSequenceId]
 		if !exists {
-			log.Print("end of reorder chunk. expected next seq id is: ", multiplexer.SignalExpectedSeqId.Load())
+			log.Print("end of reorder chunk. expected next seq id is: ", currentSequenceId)
 			return
 		}
 
@@ -404,7 +428,50 @@ func (multiplexer *WebsocketMultiplexer) DoQuickResendLoop() {
 	}
 }
 
+func (multiplexer *WebsocketMultiplexer) HandleSocketDied(streamIndex uint32) int {
+	packetsToBeRetransmitted := 0
+
+	multiplexer.UnacknowledgedPacketMu.Lock()
+	defer multiplexer.UnacknowledgedPacketMu.Unlock()
+
+	for seqId, packet := range multiplexer.UnacknowledgedPackets {
+		if packet.WebsocketIndex == streamIndex {
+			packetsToBeRetransmitted++
+
+			multiplexer.QuickRetryQueueMu.Lock()
+			multiplexer.QuickRetryQueue = append(multiplexer.QuickRetryQueue, &ToRetry{
+				FirstIndex:         packet.WebsocketIndex,
+				CurrentIndex:       packet.WebsocketIndex,
+				Data:               packet.Payload,
+				OriginalSequenceId: seqId,
+			})
+			multiplexer.QuickRetryQueueMu.Unlock()
+			delete(multiplexer.UnacknowledgedPackets, seqId)
+		}
+	}
+
+	return packetsToBeRetransmitted
+}
+
 func (multiplexer *WebsocketMultiplexer) Initialize() {
 	log.Print("initializing websocket multiplexer")
 	go multiplexer.DoQuickResendLoop()
+}
+
+func (multiplexer *WebsocketMultiplexer) SetSecretOnAll() {
+	multiplexer.StreamsMu.Lock()
+	defer multiplexer.StreamsMu.Unlock()
+
+	for _, conn := range multiplexer.Streams {
+		conn.SetSharedSecret(multiplexer.SharedSecret)
+	}
+}
+
+func (multiplexer *WebsocketMultiplexer) SetReadyToAll() {
+	multiplexer.StreamsMu.Lock()
+	defer multiplexer.StreamsMu.Unlock()
+
+	for _, conn := range multiplexer.Streams {
+		conn.SetReady(true)
+	}
 }

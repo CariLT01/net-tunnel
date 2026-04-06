@@ -8,3 +8,6 @@
 
 # Ignore config
 /client/clientConfig.json
+
+/client/client.log
+/server/server.log

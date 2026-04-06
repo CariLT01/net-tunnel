@@ -51,27 +51,7 @@ func (app *ConnectionHandler) connectToWebsocket() (*shared.WSStream, error) {
 
 func (app *ConnectionHandler) onSocketDied(conn *shared.WSStream) {
 
-	packetsToBeRetransmitted := 0
-
-	app.multiplexer.UnacknowledgedPacketMu.Lock()
-
-	for seqId, packet := range app.multiplexer.UnacknowledgedPackets {
-		if packet.WebsocketIndex == conn.Index {
-			packetsToBeRetransmitted++
-
-			app.multiplexer.QuickRetryQueueMu.Lock()
-			app.multiplexer.QuickRetryQueue = append(app.multiplexer.QuickRetryQueue, &shared.ToRetry{
-				FirstIndex:         packet.WebsocketIndex,
-				CurrentIndex:       packet.WebsocketIndex,
-				Data:               packet.Payload,
-				OriginalSequenceId: seqId,
-			})
-			app.multiplexer.QuickRetryQueueMu.Unlock()
-
-		}
-	}
-
-	app.multiplexer.UnacknowledgedPacketMu.Unlock()
+	packetsToBeRetransmitted := app.multiplexer.HandleSocketDied(conn.Index)
 
 	log.Print("count packets to be retransmitted: ", packetsToBeRetransmitted)
 	log.Print("attempting to reconnect")
@@ -203,6 +183,7 @@ func (app *ConnectionHandler) HandleWebsocketMessage(signalpacket *shared.Signal
 		}
 
 		app.multiplexer.SharedSecret = sharedSecret
+		app.multiplexer.SetSecretOnAll()
 
 		app.multiplexer.SendSignal(shared.MessageTypeHandshake, ciphertext)
 		app.multiplexer.HandshakeTranscript = append(app.multiplexer.HandshakeTranscript, ciphertext...)
@@ -253,6 +234,8 @@ func (app *ConnectionHandler) HandleWebsocketMessage(signalpacket *shared.Signal
 			}
 
 			app.multiplexer.Ready.Store(true)
+			app.multiplexer.SetReadyToAll()
+			app.multiplexer.SetSecretOnAll()
 
 			log.Print("connection is ready")
 
@@ -309,12 +292,13 @@ func (app *ConnectionHandler) HandleWebsocketRead(conn *shared.WSStream) {
 
 	} else {
 		conn.SetReady(true)
+		app.multiplexer.SetSecretOnAll()
 	}
 
 	// step-by-step protocol
 
 	for {
-		_, rawMessage, err := conn.GetConnection().ReadMessage()
+		_, rawMessageEncrypted, err := conn.GetConnection().ReadMessage()
 		if err != nil {
 			log.Print("Proxy Websocket Disconnected")
 			conn.SetReady(false)
@@ -323,11 +307,20 @@ func (app *ConnectionHandler) HandleWebsocketRead(conn *shared.WSStream) {
 			app.multiplexer.DeleteWebsocketStream(conn)
 			break
 		}
+		rawMessage, err := conn.DecodeReadData(rawMessageEncrypted)
+		if err != nil {
+			log.Print("Failed to decrypt message: ", err)
+			continue
+		}
 
 		decodedPacket := app.multiplexer.DecodePacket(rawMessage)
 		// don't ACK the ACk
 		if decodedPacket.MessageType != shared.MessageTypeAcknowledged {
-			app.multiplexer.SendAcknowledged(decodedPacket.SequenceId)
+			if decodedPacket.MessageType != shared.MessageTypeReady {
+				// if it is ready, do it AFTER processing
+				app.multiplexer.SendAcknowledged(decodedPacket.SequenceId)
+			}
+
 		}
 
 		if decodedPacket.MessageType == shared.MessageTypeNetwork {
@@ -349,6 +342,12 @@ func (app *ConnectionHandler) HandleWebsocketRead(conn *shared.WSStream) {
 		} else if decodedPacket.MessageType == shared.MessageTypeAcknowledged {
 			app.multiplexer.ReorderSignalPackets(decodedPacket, app.HandleWebsocketMessage)
 		}
+
+		if decodedPacket.MessageType == shared.MessageTypeReady {
+			// If it's a ready packet, do it AFTER
+			app.multiplexer.SendAcknowledged(decodedPacket.SequenceId)
+		}
+
 	}
 }
 

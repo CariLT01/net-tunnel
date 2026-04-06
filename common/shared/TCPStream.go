@@ -56,8 +56,7 @@ func (stream *TCPStream) OnPacketReceived(packet []byte, sequenceId uint32) {
 }
 
 func (stream *TCPStream) EncodePacketPayload(clientId byte, packetData []byte) []byte {
-	currentSeqId := stream.sendSequenceId.Load()
-	stream.sendSequenceId.Add(1)
+	currentSeqId := stream.sendSequenceId.Add(1) - 1
 
 	seqIdBuf := make([]byte, 4)
 	binary.BigEndian.PutUint32(seqIdBuf, uint32(currentSeqId))

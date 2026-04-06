@@ -1,6 +1,7 @@
 package shared
 
 import (
+	"log"
 	"sync"
 	"sync/atomic"
 
@@ -44,14 +45,18 @@ func (stream *WSStream) WriteRaw(rawData []byte) error {
 func (stream *WSStream) WriteData(rawData []byte) error {
 	if stream.ready.Load() {
 		// encrypt
+		log.Print("ready is true, encrypting: ", rawData)
 		encryptedData, err := Encrypt(stream.sharedSecret, rawData)
 		if err != nil {
+			log.Print("failed to encrypt! DEBUG PLEASE REMOVE LATER secret: ", stream.sharedSecret)
 			return err
 		}
+		log.Print("encrypting data")
 
 		err = stream.WriteRaw(encryptedData)
 		return err
 	} else {
+		log.Print("ready isn't true, not encrypting: ", rawData)
 		// write directly
 		err := stream.WriteRaw(rawData)
 		return err
@@ -59,6 +64,7 @@ func (stream *WSStream) WriteData(rawData []byte) error {
 }
 func (stream *WSStream) DecodeReadData(rawData []byte) ([]byte, error) {
 	if stream.ready.Load() {
+
 		decryptedData, err := Decrypt(stream.sharedSecret, rawData)
 		if err != nil {
 			return nil, err

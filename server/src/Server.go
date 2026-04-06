@@ -172,6 +172,7 @@ func (session *Session) ProcessSignalPacket(signalpacket *shared.SignalDecodedPa
 			return shared.PacketProcessingDisconnect
 		}
 		session.multiplexer.SharedSecret = sharedSecret
+		session.multiplexer.SetSecretOnAll()
 
 		transcriptSignature := Sign(CERTIFICATE_PRIVATE_KEY, session.multiplexer.HandshakeTranscript)
 
@@ -182,6 +183,7 @@ func (session *Session) ProcessSignalPacket(signalpacket *shared.SignalDecodedPa
 		log.Print("transcript signature: ", transcriptSignature)
 		log.Print("transcript: ", session.multiplexer.HandshakeTranscript)
 		session.multiplexer.SharedSecret = sharedSecret
+		session.multiplexer.SetSecretOnAll()
 		session.multiplexer.ProtocolCompletion.EncryptionEstablished = true
 
 	} else if signalpacket.MessageType == shared.MessageTypeStreamDisconnect {
@@ -283,6 +285,7 @@ func (session *Session) ProcessSignalPacket(signalpacket *shared.SignalDecodedPa
 		}
 
 		session.multiplexer.Ready.Store(true)
+		session.multiplexer.SetReadyToAll()
 
 	} else if signalpacket.MessageType == shared.MessageTypeAcknowledged {
 		session.multiplexer.UnacknowledgedPacketMu.Lock()
@@ -313,8 +316,10 @@ func (session *Session) HandleWebsocketLoop(conn *shared.WSStream) {
 	session.clientsActive.Add(1)
 	defer conn.Close()
 	defer session.clientsActive.Add(-1)
+	defer session.multiplexer.SetInactive(conn)
 	defer session.multiplexer.DeleteWebsocketStream(conn)
 	defer func() {
+		session.multiplexer.HandleSocketDied(conn.Index)
 		conn.SetReady(false)
 	}()
 	if !session.multiplexer.IsDoingHandshake.Load() {
@@ -333,6 +338,11 @@ func (session *Session) HandleWebsocketLoop(conn *shared.WSStream) {
 
 	session.multiplexer.SetActive(conn)
 
+	if session.multiplexer.Ready.Load() {
+		conn.SetReady(true)
+		session.multiplexer.SetSecretOnAll()
+	}
+
 	//server.WebsocketWriteMessage(conn, []byte{1}) // send READY status immediately
 
 	for {
@@ -343,7 +353,7 @@ func (session *Session) HandleWebsocketLoop(conn *shared.WSStream) {
 		}
 		decryptedMessage, err := conn.DecodeReadData(rawMessage)
 		if err != nil {
-			log.Print("error: failed to decode read message: ", err)
+			log.Print("error: failed to decode read message: ", err, " message: ", rawMessage)
 			continue
 		}
 

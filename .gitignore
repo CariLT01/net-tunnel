@@ -11,3 +11,10 @@
 
 /client/client.log
 /server/server.log
+
+# Ignore all the stream and logs!
+/client/debugStream.log
+/client/state_logs.log
+
+/server/debugStream.log
+/server/state_logs.log

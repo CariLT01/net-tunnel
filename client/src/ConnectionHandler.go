@@ -286,6 +286,7 @@ func (app *ConnectionHandler) HandleWebsocketRead(conn *shared.WSStream) {
 	if !app.multiplexer.Ready.Load() {
 		log.Print("not ready")
 		if app.multiplexer.IsDoingHandshake.Load() == false {
+			app.multiplexer.IsDoingHandshake.Store(true)
 			// first send message 4, which is clientHello
 			nonce, err := GenerateSecureSecret()
 			if err != nil {
@@ -295,8 +296,6 @@ func (app *ConnectionHandler) HandleWebsocketRead(conn *shared.WSStream) {
 			app.multiplexer.SendSignal(shared.MessageTypeClientHello, nonce)
 			app.multiplexer.HandshakeTranscript = append(app.multiplexer.HandshakeTranscript, nonce...)
 			log.Print("sent client hello nonce")
-
-			app.multiplexer.IsDoingHandshake.Store(true)
 		} else {
 			log.Print("already doing handshake")
 		}

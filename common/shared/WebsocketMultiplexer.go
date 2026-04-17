@@ -79,6 +79,8 @@ type WebsocketMultiplexer struct {
 	PrivateKey   *kyber768.PrivateKey
 
 	StreamFile *os.File
+
+	DebugWriter *ProtocolDebugStateWriter
 }
 
 /*
@@ -116,7 +118,7 @@ func NewWebsocketMultiplexer() *WebsocketMultiplexer {
 		log.Fatal("couldn't open streaming file")
 	}
 
-	return &WebsocketMultiplexer{
+	mx := &WebsocketMultiplexer{
 		Streams:               make(map[uint32]*WSStream),
 		ActiveStreamIndexes:   make([]uint32, 0),
 		SignalUnordered:       make(map[uint32]*SignalDecodedPacket),
@@ -135,7 +137,19 @@ func NewWebsocketMultiplexer() *WebsocketMultiplexer {
 
 		Scheme:     kyber768.Scheme(),
 		StreamFile: streamFile,
+
+		DebugWriter: NewProtocolDebugStateWriter(),
 	}
+
+	// run initialization functions
+	mx.DebugWriter.Initialize("state_logs.log")
+
+	return mx
+}
+
+func (multiplexer *WebsocketMultiplexer) UpdateCurrentStateData() {
+	multiplexer.DebugWriter.WriteDebugState(multiplexer)
+	log.Print("After writing")
 }
 
 func (multiplexer *WebsocketMultiplexer) StreamInLog(data []byte, label string) {
@@ -176,7 +190,7 @@ func (multiplexer *WebsocketMultiplexer) EncodePayload(payload []byte, currentDa
 	return encodedPayload
 }
 
-func (multiplexer *WebsocketMultiplexer) SendDataOnAnyWithIndex(currentCounter uint32, payload []byte, existingSeqId *uint32) {
+func (multiplexer *WebsocketMultiplexer) SendDataOnAnyWithIndex(currentCounter uint32, payload []byte, existingSeqId *uint32, reliable bool) {
 	multiplexer.ActiveStreamIndexesMu.RLock()
 	activeStreamsCount := len(multiplexer.ActiveStreamIndexes)
 
@@ -193,6 +207,7 @@ func (multiplexer *WebsocketMultiplexer) SendDataOnAnyWithIndex(currentCounter u
 
 		currentDataSeqId = multiplexer.MultiplexerSequenceID.Add(1) - 1
 		log.Print("incremented seq id by 1 to: ", currentDataSeqId)
+		multiplexer.UpdateCurrentStateData()
 	} else {
 		currentDataSeqId = *existingSeqId
 	}
@@ -231,28 +246,33 @@ func (multiplexer *WebsocketMultiplexer) SendDataOnAnyWithIndex(currentCounter u
 		})
 		multiplexer.QuickRetryQueueMu.Unlock()
 	} else {
-		multiplexer.UnacknowledgedPacketMu.Lock()
-		log.Print("write current data seq id ", currentDataSeqId, " to be acknowledged")
-		multiplexer.UnacknowledgedPackets[currentDataSeqId] = &UnacknowledgedPacket{
-			WebsocketIndex: targetStreamIndex,
-			Payload:        payload,
+		// only reliable packets should be Written
+		// all packets are reliable, except ACK
+		if reliable {
+			multiplexer.UnacknowledgedPacketMu.Lock()
+			log.Print("write current data seq id ", currentDataSeqId, " to be acknowledged")
+			multiplexer.UnacknowledgedPackets[currentDataSeqId] = &UnacknowledgedPacket{
+				WebsocketIndex: targetStreamIndex,
+				Payload:        payload,
+			}
+			multiplexer.UnacknowledgedPacketMu.Unlock()
 		}
-		multiplexer.UnacknowledgedPacketMu.Unlock()
+
 	}
 }
 
-func (multiplexer *WebsocketMultiplexer) SendSignalRawOnAny(payload []byte, existingSeq *uint32) {
+func (multiplexer *WebsocketMultiplexer) SendSignalRawOnAny(payload []byte, existingSeq *uint32, reliable bool) {
 	currentCounter := multiplexer.SignalRoundRobinCounter.Load()
 	multiplexer.SignalRoundRobinCounter.Add(1)
 
-	multiplexer.SendDataOnAnyWithIndex(currentCounter, payload, existingSeq)
+	multiplexer.SendDataOnAnyWithIndex(currentCounter, payload, existingSeq, reliable)
 }
 
-func (multiplexer *WebsocketMultiplexer) SendDataRawOnAny(payload []byte, existingSeq *uint32) {
+func (multiplexer *WebsocketMultiplexer) SendDataRawOnAny(payload []byte, existingSeq *uint32, reliable bool) {
 	currentCounter := multiplexer.DataStreamRoundRobinCounter.Load()
 	multiplexer.DataStreamRoundRobinCounter.Add(1)
 
-	multiplexer.SendDataOnAnyWithIndex(currentCounter, payload, existingSeq)
+	multiplexer.SendDataOnAnyWithIndex(currentCounter, payload, existingSeq, reliable)
 }
 
 func (multiplexer *WebsocketMultiplexer) SendSignal(messageType MessageType, data []byte) {
@@ -264,7 +284,10 @@ func (multiplexer *WebsocketMultiplexer) SendSignal(messageType MessageType, dat
 	payloadPacket := append(seqIdBuf, data...)
 
 	encodedPacket := multiplexer.EncodePacket(messageType, payloadPacket)
-	multiplexer.SendSignalRawOnAny(encodedPacket, nil)
+	multiplexer.SendSignalRawOnAny(encodedPacket, nil, messageType != MessageTypeAcknowledged)
+
+	// update state_logs
+	multiplexer.UpdateCurrentStateData()
 }
 
 func (multiplexer *WebsocketMultiplexer) SendSignalOnWebsocket(wsStream *WSStream, messageType MessageType, data []byte) error {
@@ -285,13 +308,17 @@ func (multiplexer *WebsocketMultiplexer) SendSignalOnWebsocket(wsStream *WSStrea
 		Payload:        encodedPayload,
 	}
 	multiplexer.UnacknowledgedPacketMu.Unlock()
+
+	// update state_logs
+	multiplexer.UpdateCurrentStateData()
+
 	return wsStream.WriteData(encodedPayload)
 
 }
 
 func (multiplexer *WebsocketMultiplexer) SendData(messageType MessageType, data []byte) {
 	encodedPacket := multiplexer.EncodePacket(messageType, data)
-	multiplexer.SendDataRawOnAny(encodedPacket, nil)
+	multiplexer.SendDataRawOnAny(encodedPacket, nil, messageType != MessageTypeAcknowledged)
 }
 
 func (multiplexer *WebsocketMultiplexer) PacketPreprocess(rawDecryptedData []byte) *PreprocessedPacket {
@@ -308,7 +335,7 @@ func (multiplexer *WebsocketMultiplexer) PacketPreprocess(rawDecryptedData []byt
 
 func (multiplexer *WebsocketMultiplexer) NewWebsocketStream(conn *websocket.Conn) *WSStream {
 	currentIndex := multiplexer.StreamCounter.Add(1) - 1
-	return &WSStream{
+	newStream := &WSStream{
 		ready:                     atomic.Bool{},
 		handshakeSucceeded:        atomic.Bool{},
 		intentionallyDisconnected: atomic.Bool{},
@@ -328,6 +355,14 @@ func (multiplexer *WebsocketMultiplexer) NewWebsocketStream(conn *websocket.Conn
 
 		Index: currentIndex,
 	}
+	// if it's already ready, it should mean
+	// handshake has already finished
+	// therefore, the following should be safe?
+	if multiplexer.Ready.Load() {
+		newStream.ready.Store(true)
+	}
+
+	return newStream
 }
 
 func (multiplexer *WebsocketMultiplexer) AddWebsocketStream(stream *WSStream) {
@@ -464,6 +499,7 @@ func (multiplexer *WebsocketMultiplexer) ReorderSignalPackets(conn *WSStream, ne
 		}
 		delete(multiplexer.SignalUnordered, currentSequenceId)
 		multiplexer.SignalExpectedSeqId.Add(1)
+		multiplexer.UpdateCurrentStateData()
 	}
 
 }
@@ -474,7 +510,7 @@ func (multiplexer *WebsocketMultiplexer) DoQuickRetry() {
 
 	for i, pckt := range multiplexer.QueuedForResend {
 		log.Print("attempting to resend packet: ", i)
-		multiplexer.SendDataRawOnAny(pckt, nil)
+		multiplexer.SendDataRawOnAny(pckt, nil, false) // ANOTHER TEMPORARY FIX. did not think through this
 		// We shouldn't need any existing signal
 		// since the MX sequencer ID should not have been incremented
 	}
@@ -491,7 +527,7 @@ func (multiplexer *WebsocketMultiplexer) DoQuickResendLoop() {
 
 		for i, pckt := range multiplexer.QuickRetryQueue {
 			log.Print("attempt to quick retry resend packet: ", i)
-			multiplexer.SendDataRawOnAny(pckt.Data, &pckt.OriginalSequenceId)
+			multiplexer.SendDataRawOnAny(pckt.Data, &pckt.OriginalSequenceId, false) // TEMPORARY FIX. did not think through this yet
 		}
 
 		multiplexer.QuickRetryQueue = multiplexer.QuickRetryQueue[:0]

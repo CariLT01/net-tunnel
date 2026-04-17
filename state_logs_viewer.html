@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Log Stream Debugger</title>
+    <style>
+        :root {
+            --bg-color: #1e1e1e;
+            --card-bg: #2d2d2d;
+            --text-color: #d4d4d4;
+            --accent-color: #4fc1ff;
+            --key-color: #9cdcfe;
+            --num-color: #b5cea8;
+            --border-color: #444;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 20px;
+        }
+
+        .controls {
+            position: sticky;
+            top: 0;
+            background-color: var(--bg-color);
+            padding: 10px 0;
+            border-bottom: 1px solid var(--border-color);
+            margin-bottom: 20px;
+            z-index: 100;
+        }
+
+        input[type="file"] {
+            background: var(--card-bg);
+            color: var(--text-color);
+            padding: 8px;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            cursor: pointer;
+        }
+
+        #output {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .log-entry {
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 15px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 13px;
+            line-height: 1.5;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        .log-entry .line-number {
+            color: #858585;
+            margin-right: 15px;
+            user-select: none;
+        }
+
+        .key { color: var(--key-color); font-weight: bold; }
+        .string { color: #ce9178; }
+        .number { color: var(--num-color); }
+        .boolean { color: #569cd6; }
+        .array-bracket { color: #ffd700; }
+    </style>
+</head>
+<body>
+
+    <div class="controls">
+        <h2>Log Stream Previewer</h2>
+        <input type="file" id="fileInput" accept=".log,.txt,.json">
+        <span id="status" style="margin-left: 15px; font-size: 0.9em; opacity: 0.8;"></span>
+    </div>
+
+    <div id="output">
+        </div>
+
+    <script>
+        const fileInput = document.getElementById('fileInput');
+        const output = document.getElementById('output');
+        const status = document.getElementById('status');
+
+        fileInput.addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            status.textContent = "Processing...";
+            output.innerHTML = "";
+
+            reader.onload = function(event) {
+                const content = event.target.result;
+                const lines = content.split(/\r?\n/);
+                let validLines = 0;
+
+                const fragment = document.createDocumentFragment();
+
+                lines.forEach((line, index) => {
+                    if (!line.trim()) return;
+
+                    try {
+                        const data = JSON.parse(line);
+                        validLines++;
+                        
+                        // Process and sort arrays
+                        const processedData = processObject(data);
+                        
+                        const entryDiv = document.createElement('div');
+                        entryDiv.className = 'log-entry';
+                        
+                        const lineSpan = document.createElement('span');
+                        lineSpan.className = 'line-number';
+                        lineSpan.textContent = `[Line ${index + 1}]`;
+                        
+                        const contentSpan = document.createElement('span');
+                        contentSpan.innerHTML = syntaxHighlight(processedData);
+                        
+                        entryDiv.appendChild(lineSpan);
+                        entryDiv.appendChild(contentSpan);
+                        fragment.appendChild(entryDiv);
+                    } catch (err) {
+                        // Skip or show error for malformed lines
+                        console.warn(`Error parsing line ${index + 1}:`, err);
+                    }
+                });
+
+                output.appendChild(fragment);
+                status.textContent = `Showing ${validLines} entries from ${file.name}`;
+            };
+
+            reader.readAsText(file);
+        });
+
+        /**
+         * Recursively finds arrays and sorts them.
+         * Logic: Sorts numbers numerically and strings alphabetically.
+         */
+        function processObject(obj) {
+            if (Array.isArray(obj)) {
+                // Sort the array (handling numbers specifically)
+                return obj.slice().sort((a, b) => {
+                    if (typeof a === 'number' && typeof b === 'number') return a - b;
+                    return String(a).localeCompare(String(b));
+                }).map(processObject);
+            } else if (obj !== null && typeof obj === 'object') {
+                const newObj = {};
+                for (let key in obj) {
+                    newObj[key] = processObject(obj[key]);
+                }
+                return newObj;
+            }
+            return obj;
+        }
+
+        /**
+         * Pretty-prints JSON with basic syntax highlighting
+         */
+        function syntaxHighlight(json) {
+            if (typeof json !== 'string') {
+                json = JSON.stringify(json, null, 2);
+            }
+            
+            return json.replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g, function (match) {
+                let cls = 'number';
+                if (/^"/.test(match)) {
+                    if (/:$/.test(match)) {
+                        cls = 'key';
+                        match = match.replace(/"/g, ''); // Remove quotes from keys for cleaner look
+                    } else {
+                        cls = 'string';
+                    }
+                } else if (/true|false/.test(match)) {
+                    cls = 'boolean';
+                } else if (/null/.test(match)) {
+                    cls = 'boolean';
+                }
+                return '<span class="' + cls + '">' + match + '</span>';
+            });
+        }
+    </script>
+</body>
+</html>

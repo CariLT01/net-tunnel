@@ -333,6 +333,7 @@ func (session *Session) HandleWebsocketLoop(conn *shared.WSStream) {
 		conn.SetReady(false)
 	}()
 	if !session.multiplexer.IsDoingHandshake.Load() {
+		session.multiplexer.IsDoingHandshake.Store(true)
 		publicKey, privateKey, err := kyber768.GenerateKeyPair(rand.Reader)
 		session.multiplexer.PublicKey = publicKey
 		session.multiplexer.PrivateKey = privateKey
@@ -341,7 +342,7 @@ func (session *Session) HandleWebsocketLoop(conn *shared.WSStream) {
 			return
 		}
 
-		session.multiplexer.IsDoingHandshake.Store(true)
+		log.Print("generated new keypair")
 	} else {
 		log.Print("not generating new key, already doing handshake")
 	}
@@ -391,11 +392,9 @@ func (session *Session) HandleWebsocketLoop(conn *shared.WSStream) {
 			message := decodedPacket.Payload
 
 			clientID := message[0]
+			session.clientIDsMu.RLock()
 			tcpConn, exists := session.clientIDs[int(clientID)]
-			if err != nil {
-				log.Print("error: failed to decrypt: ", err)
-				continue
-			}
+			session.clientIDsMu.RUnlock()
 			messagePayload := message[1:]
 			if !exists {
 				log.Print("unknown client id ", clientID, " attempting to dial")

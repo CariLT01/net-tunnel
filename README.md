@@ -2,6 +2,9 @@
 
 Lightweight encrypted tunnel for browsing
 
+> [!WARNING]
+> Very experimental
+
 ## Features
 
 - Encryption
